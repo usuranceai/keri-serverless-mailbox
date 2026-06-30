@@ -15,9 +15,14 @@ from keri import help, kering
 logger = help.ogler.getLogger(__name__)
 
 
-def run_standard(*, hab, eid, topics, on_message, cursor_store, retry_ms=1000):
+def run_standard(*, hab, eid, topics, on_message, cursor_store, retry_ms=1000, scheduler):
     """hio doer generator. SSE-polls eid's mailbox; per event calls
-    on_message(topic, raw_cesr_bytes) and cursor_store.set(eid, topic, idx)."""
+    on_message(topic, raw_cesr_bytes) and cursor_store.set(eid, topic, idx).
+
+    scheduler is the owning hio DoDoer (the MailboxClientDoer): we .extend([clientDoer])
+    after httpClient so the host Doist services it (clientDoer.recur() -> client.service()
+    flushes client.requests over the wire and reads the SSE response into client.events),
+    then .remove([clientDoer]) when the 30s poll window ends. Mirrors the old Poller."""
     tock = 0.0
     _ = (yield tock)
     retry = retry_ms
@@ -29,6 +34,8 @@ def run_standard(*, hab, eid, topics, on_message, cursor_store, retry_ms=1000):
             traceback.print_exception(e, file=sys.stderr)
             yield tock
             continue
+
+        scheduler.extend([clientDoer])    # host Doist now services clientDoer (flushes requests / reads SSE)
 
         # Build the mbx query from per-topic cursors (last-seen + 1, or 0 if unseen).
         q_topics = {}
@@ -64,4 +71,6 @@ def run_standard(*, hab, eid, topics, on_message, cursor_store, retry_ms=1000):
                 cursor_store.set(eid, tpc, int(idx))
                 yield tock
             yield 0.25
+
+        scheduler.remove([clientDoer])    # window over: stop servicing this clientDoer
         yield retry / 1000

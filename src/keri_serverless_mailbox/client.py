@@ -44,6 +44,9 @@ class MailboxClientDoer(doing.DoDoer):
             logger.info(f"no mailbox resolved for {c.hab.pre}; not polling")
             return
         strategy = c.strategy_for(eid)
+        # scheduler=self: MailboxClientDoer IS a DoDoer (has .extend/.remove) and is already
+        # entered/running on the host Doist when runDo executes, so extending it schedules the
+        # strategy's transport doer(s) on that same Doist -- exactly how the old Poller worked.
         yield from strategy.run(hab=c.hab, eid=eid, topics=c.topics,
                                 on_message=c.on_message, cursor_store=c.cursor_store,
-                                retry_ms=c.retry_ms)
+                                retry_ms=c.retry_ms, scheduler=self)
