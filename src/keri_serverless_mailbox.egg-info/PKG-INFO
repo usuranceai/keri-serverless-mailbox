@@ -1,7 +1,0 @@
-Metadata-Version: 2.4
-Name: keri-serverless-mailbox
-Version: 0.1.0
-Summary: Universal KERI mailbox client: resolve via agenting.mailbox, discover capability from the KEL, run a swappable retrieval strategy (Standard SSE; Serverless WS in Phase 3).
-Requires-Python: >=3.12
-Requires-Dist: keri
-Requires-Dist: hio
