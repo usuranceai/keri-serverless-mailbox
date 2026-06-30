@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "keri-serverless-mailbox"
+version = "0.1.0"
+description = "Universal KERI mailbox client: resolve via agenting.mailbox, discover capability from the KEL, run a swappable retrieval strategy (Standard SSE; Serverless WS in Phase 3)."
+requires-python = ">=3.12"
+dependencies = ["keri", "hio"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src", "../keripy/src"]
+testpaths = ["tests"]

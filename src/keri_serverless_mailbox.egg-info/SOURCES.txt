@@ -1,0 +1,8 @@
+pyproject.toml
+src/keri_serverless_mailbox/__init__.py
+src/keri_serverless_mailbox.egg-info/PKG-INFO
+src/keri_serverless_mailbox.egg-info/SOURCES.txt
+src/keri_serverless_mailbox.egg-info/dependency_links.txt
+src/keri_serverless_mailbox.egg-info/requires.txt
+src/keri_serverless_mailbox.egg-info/top_level.txt
+tests/test_discovery.py
