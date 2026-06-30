@@ -26,6 +26,6 @@ def test_discover_degrades_to_standard_on_stock_keripy(monkeypatch):
     monkeypatch.setattr(strategy_module, "_WSS", None)   # simulate stock keripy
     with habbing.openHby(name="disc3", temp=True) as hby:
         hab = hby.makeHab(name="svc")
-        hab.db.locs.pin(keys=(hab.pre, Schemes.wss),
+        hab.db.locs.pin(keys=(hab.pre, "wss"),
                         val=LocationRecord(url="wss://mailbox.example/prod"))
         assert isinstance(discover_strategy(hab, hab.pre), StandardStrategy)

@@ -37,40 +37,42 @@ def run_standard(*, hab, eid, topics, on_message, cursor_store, retry_ms=1000, s
 
         scheduler.extend([clientDoer])    # host Doist now services clientDoer (flushes requests / reads SSE)
 
-        # Build the mbx query from per-topic cursors (last-seen + 1, or 0 if unseen).
-        q_topics = {}
-        for topic in topics:
-            seen = cursor_store.get(eid, topic)
-            q_topics[topic] = (seen + 1) if seen is not None else 0
-        q = dict(pre=hab.pre, topics=q_topics)
+        try:
+            # Build the mbx query from per-topic cursors (last-seen + 1, or 0 if unseen).
+            q_topics = {}
+            for topic in topics:
+                seen = cursor_store.get(eid, topic)
+                q_topics[topic] = (seen + 1) if seen is not None else 0
+            q = dict(pre=hab.pre, topics=q_topics)
 
-        mhab = getattr(hab, "mhab", None)         # GroupHab: query via the member hab
-        querier = mhab if mhab is not None else hab
-        msg = querier.query(pre=hab.pre, src=eid, route="mbx", query=q)
-        httping.createCESRRequest(msg, client, dest=eid)
+            mhab = getattr(hab, "mhab", None)         # GroupHab: query via the member hab
+            querier = mhab if mhab is not None else hab
+            msg = querier.query(pre=hab.pre, src=eid, route="mbx", query=q)
+            httping.createCESRRequest(msg, client, dest=eid)
 
-        while client.requests:
-            yield tock
-
-        created = helping.nowUTC()
-        while True:
-            if helping.nowUTC() - created > datetime.timedelta(seconds=30):
-                break
-            while client.events:
-                evt = client.events.popleft()
-                if "retry" in evt:
-                    retry = evt["retry"]
-                if "id" not in evt or "data" not in evt or "name" not in evt:
-                    logger.error(f"bad mailbox event: {evt}")
-                    continue
-                idx, data, tpc = evt["id"], evt["data"], evt["name"]
-                if idx == "" or not data or not tpc:
-                    logger.error(f"bad mailbox event: {evt}")
-                    continue
-                on_message(tpc, data.encode("utf-8") if isinstance(data, str) else data)
-                cursor_store.set(eid, tpc, int(idx))
+            while client.requests:
                 yield tock
-            yield 0.25
 
-        scheduler.remove([clientDoer])    # window over: stop servicing this clientDoer
+            created = helping.nowUTC()
+            while True:
+                if helping.nowUTC() - created > datetime.timedelta(seconds=30):
+                    break
+                while client.events:
+                    evt = client.events.popleft()
+                    if "retry" in evt:
+                        retry = evt["retry"]
+                    if "id" not in evt or "data" not in evt or "name" not in evt:
+                        logger.error(f"bad mailbox event: {evt}")
+                        continue
+                    idx, data, tpc = evt["id"], evt["data"], evt["name"]
+                    if idx == "" or not data or not tpc:
+                        logger.error(f"bad mailbox event: {evt}")
+                        continue
+                    on_message(tpc, data.encode("utf-8") if isinstance(data, str) else data)
+                    cursor_store.set(eid, tpc, int(idx))
+                    yield tock
+                yield 0.25
+        finally:
+            scheduler.remove([clientDoer])    # window over: stop servicing this clientDoer
+
         yield retry / 1000
