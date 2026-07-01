@@ -1,4 +1,4 @@
-"""ServerlessStrategy transport: WebSocket notify-and-fetch.
+"""ServerlessStrategy transport: WebSocket notify-and-fetch, hio-native.
 
 Two channels, two transports:
 
@@ -9,19 +9,33 @@ Two channels, two transports:
     ``run_standard`` uses). On a nudge (or the infrequent safety-net timer) the client does ONE
     signed ``qry r=/mbx`` fetch and reads the drain the server produces (drain-and-close).
 
-Testability is the Phase-2 lesson: ALL scheduling / fetch LOGIC lives in the hio generator
-(``run_serverless`` — the tested unit); the WebSocket I/O is a thin, INJECTABLE pump running on
-a background thread. Tests inject a fake pump whose nudge queue is fed synchronously, so the
-generator is driven deterministically with no real socket and no thread-timing flakiness.
+**hio-native, no thread.** The whole client runs on the host hio Doist: ``run_serverless`` is a
+doer generator serviced by the SAME Doist as ``fetch_once`` (the HTTP drain). The WebSocket I/O
+is ALSO serviced by that Doist — there is NO background thread and NO asyncio. hio ships no WS
+client, so ``WsClient`` builds a minimal RFC-6455 client over ``hio.core.tcp.clienting.ClientTls``:
+the underlying ``ClientTls`` is wrapped in a stock ``ClientDoer`` and scheduled on the owning
+DoDoer (``scheduler.extend([clientDoer])``) exactly like ``httpClient``'s clientDoer, so the host
+Doist drives connect/TLS/tx/rx; ``run_serverless`` pumps the WS state machine (handshake, subscribe,
+frame parse) once per tick against ``client.rxbs`` / ``client.tx``.
 
-Stock keripy / hio + ``websockets`` only. Host-agnostic (no Locksmith, no Qt)."""
+Testability: ALL scheduling / fetch LOGIC lives in the ``run_serverless`` generator (the tested
+unit); the WS source is an INJECTABLE ``ws_factory``. Tests inject a fake WS source whose nudge
+queue is fed synchronously, so the generator is driven deterministically with no real socket.
+
+Stock keripy / hio + stdlib only (hashlib / base64 / os / struct). NO ``websockets`` dependency.
+Host-agnostic (no Locksmith, no Qt)."""
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
+import os
 import queue
-import threading
+import struct
 import time
+from urllib.parse import urlparse
+
+from hio.core.tcp import clienting as tcp_clienting
 
 from keri import help
 from keri.kering import Schemes
@@ -39,18 +53,33 @@ DEFAULT_PING_MS = 4 * 60 * 1000          # 4 min < 10-min idle timeout
 DEFAULT_SAFETY_NET_MS = 5 * 60 * 1000    # 5 min backstop
 _RECONNECT_CAP_MS = 30 * 1000            # exponential backoff cap
 
+# RFC 6455 GUID for the Sec-WebSocket-Accept handshake proof.
+_WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+# WebSocket opcodes.
+_OP_CONT = 0x0
+_OP_TEXT = 0x1
+_OP_BINARY = 0x2
+_OP_CLOSE = 0x8
+_OP_PING = 0x9
+_OP_PONG = 0xA
+
 
 def run_serverless(*, hab, eid, topics, on_message, cursor_store, retry_ms=1000, scheduler,
                    ws_factory=None, safety_net_ms=DEFAULT_SAFETY_NET_MS, ping_ms=DEFAULT_PING_MS):
-    """hio doer generator. Opens one idle WS via the pump, then on each nudge (or the
-    safety-net cadence) performs ONE signed-qry HTTP fetch through the shared fetch core.
+    """hio doer generator. Opens one idle WS (hio-native, serviced by ``scheduler``'s Doist),
+    then on each nudge (or the safety-net cadence) performs ONE signed-qry HTTP fetch through
+    the shared fetch core.
 
-    ``scheduler`` is the owning hio DoDoer; the fetch schedules its clientDoer on it
-    (extend/remove) exactly like ``run_standard`` — otherwise nothing flushes over the wire.
+    ``scheduler`` is the owning hio DoDoer; both the WS client's clientDoer and each fetch's
+    clientDoer are scheduled on it (extend/remove) exactly like ``run_standard`` — otherwise
+    nothing flushes over the wire.
 
-    ``ws_factory(**kwargs) -> pump`` is injectable: the default opens a real background-thread
-    ``websockets`` pump; tests inject a fake pump whose nudge queue they feed synchronously.
-    A pump exposes: ``.start()``, ``.stop()``, and ``.nudges`` (a thread-safe ``queue.Queue``)."""
+    ``ws_factory(**kwargs) -> ws`` is injectable. The default builds a real hio-native
+    ``WsClient`` over ``ClientTls`` and schedules its clientDoer on ``scheduler``; tests inject a
+    fake WS source whose nudge queue they feed synchronously. A WS source exposes:
+    ``.pump()`` (serviced each tick — drive handshake/parse; the default no-ops for fakes),
+    ``.stop()``, and ``.nudges`` (a ``queue.Queue``)."""
     tock = 0.0
     _ = (yield tock)
 
@@ -72,16 +101,21 @@ def run_serverless(*, hab, eid, topics, on_message, cursor_store, retry_ms=1000,
         qry_b64 = base64.b64encode(bytes(msg)).decode("ascii")
         return {"action": "subscribe", "qry": qry_b64}
 
-    pump = ws_factory(hab=hab, eid=eid, url=url, subscribe_builder=_subscribe_builder,
-                      retry_ms=retry_ms, ping_ms=ping_ms)
-    pump.start()
+    ws = ws_factory(hab=hab, eid=eid, url=url, subscribe_builder=_subscribe_builder,
+                    retry_ms=retry_ms, ping_ms=ping_ms, scheduler=scheduler)
 
     last_safety = _monotonic()
     try:
         while True:
             nudge_received = False
 
-            # Drain any nudges the pump pushed onto the thread-safe queue.
+            # Service the WS I/O this tick (connect/TLS handshake progress, WS upgrade,
+            # subscribe, inbound frame parse, ping/pong keep-alive, reconnect on drop).
+            # For the real client this drives the ClientTls the host Doist already services;
+            # for the injected fake it is a no-op.
+            ws.pump()
+
+            # Drain any nudges the WS pushed onto its queue.
             # NOTE: the nudge topic is advisory — the server sends the bare /fwd modifier form
             # (e.g. "credential") while the client's subscribed topics are slash-prefixed
             # ("/credential"). Using the nudge's topic string to narrow the fetch would build
@@ -90,7 +124,7 @@ def run_serverless(*, hab, eid, topics, on_message, cursor_store, retry_ms=1000,
             # re-drain ALL of the client's subscribed (slash-prefixed) topics past their cursors.
             while True:
                 try:
-                    pump.nudges.get_nowait()
+                    ws.nudges.get_nowait()
                 except queue.Empty:
                     break
                 nudge_received = True   # bare vs. slash form doesn't matter; wake → full drain
@@ -110,103 +144,285 @@ def run_serverless(*, hab, eid, topics, on_message, cursor_store, retry_ms=1000,
 
             yield tock
     finally:
-        pump.stop()
+        ws.stop()
 
 
 # --------------------------------------------------------------------------------------------
-# Default WS pump: a thin I/O component on a background thread. Not exercised by unit tests
-# (they inject a fake); kept small and free of fetch/scheduling logic (that lives in the doer).
+# hio-native WS client: a minimal RFC-6455 client over ClientTls, serviced by the host Doist.
+# NOT exercised by the run_serverless unit tests (they inject a fake ws source); its framing /
+# handshake are unit-tested directly below (test_serverless_strategy.py) with a fake ClientTls.
 
-class WsPump:
-    """Idle-WebSocket thread pump. On start it connects, sends the subscribe envelope, then
-    receives frames pushing each ``mailbox.nudge`` onto ``self.nudges``. Sends WS pings more
-    often than the ~10-min idle timeout; on close/drop reconnects with exponential backoff and
-    RE-SUBSCRIBES with the current cursors (``subscribe_builder`` is re-evaluated each connect).
+# Connection lifecycle states.
+_ST_CONNECTING = "connecting"    # ClientTls establishing TCP+TLS
+_ST_HANDSHAKE = "handshake"      # HTTP/1.1 Upgrade sent, awaiting 101
+_ST_OPEN = "open"                # WS open, subscribe sent, streaming frames
+_ST_CLOSED = "closed"            # dropped/errored; awaiting backoff before reconnect
 
-    ``connect_factory(url) -> connection`` is injectable so even this class is testable without
-    a real socket; the default uses ``websockets.sync.client.connect``. A connection must expose
-    blocking ``send(str)`` / ``recv(timeout)`` / ``ping()`` / ``close()`` (the ``websockets``
-    sync client surface)."""
 
-    def __init__(self, *, hab, eid, url, subscribe_builder, retry_ms=1000, ping_ms=DEFAULT_PING_MS,
-                 connect_factory=None):
+def _ws_frame(opcode, payload=b""):
+    """Encode a client->server WebSocket frame (FIN=1, masked per RFC 6455). ``payload`` is
+    bytes. Handles the 7-bit / 16-bit / 64-bit length forms."""
+    b0 = 0x80 | (opcode & 0x0F)                 # FIN=1
+    n = len(payload)
+    header = bytearray([b0])
+    if n < 126:
+        header.append(0x80 | n)                 # mask bit set + 7-bit length
+    elif n < (1 << 16):
+        header.append(0x80 | 126)
+        header.extend(struct.pack("!H", n))
+    else:
+        header.append(0x80 | 127)
+        header.extend(struct.pack("!Q", n))
+    mask = os.urandom(4)
+    header.extend(mask)
+    masked = bytes(b ^ mask[i & 3] for i, b in enumerate(payload))
+    return bytes(header) + masked
+
+
+def _parse_ws_frames(buf):
+    """Parse as many complete server->client frames from ``buf`` (a bytearray) as are present.
+    Server frames are UNMASKED. Returns a list of ``(opcode, payload_bytes)`` and consumes the
+    parsed bytes from ``buf`` in place; a partial trailing frame is left for the next call."""
+    frames = []
+    while True:
+        if len(buf) < 2:
+            break
+        b0, b1 = buf[0], buf[1]
+        opcode = b0 & 0x0F
+        masked = (b1 & 0x80) != 0
+        length = b1 & 0x7F
+        offset = 2
+        if length == 126:
+            if len(buf) < offset + 2:
+                break
+            length = struct.unpack("!H", bytes(buf[offset:offset + 2]))[0]
+            offset += 2
+        elif length == 127:
+            if len(buf) < offset + 8:
+                break
+            length = struct.unpack("!Q", bytes(buf[offset:offset + 8]))[0]
+            offset += 8
+        mask = b""
+        if masked:                              # servers shouldn't mask, but handle defensively
+            if len(buf) < offset + 4:
+                break
+            mask = bytes(buf[offset:offset + 4])
+            offset += 4
+        if len(buf) < offset + length:
+            break                               # partial frame; wait for more bytes
+        payload = bytes(buf[offset:offset + length])
+        if masked:
+            payload = bytes(b ^ mask[i & 3] for i, b in enumerate(payload))
+        del buf[:offset + length]
+        frames.append((opcode, payload))
+    return frames
+
+
+class WsClient:
+    """Minimal hio-native RFC-6455 WebSocket client over ``ClientTls``.
+
+    On start it schedules a stock ``ClientDoer`` (over the ClientTls) on the host ``scheduler``,
+    so the host Doist services the socket (connect/TLS/tx/rx). ``pump()`` — called once per tick
+    by ``run_serverless`` on the same Doist — advances the WS state machine: after TLS connects it
+    sends the HTTP Upgrade, verifies the ``101`` + ``Sec-WebSocket-Accept``, sends the subscribe
+    envelope (built by ``subscribe_builder`` with current cursors), parses inbound frames from
+    ``client.rxbs`` pushing each ``mailbox.nudge`` onto ``self.nudges``, replies PONG to PING, and
+    sends periodic PING keep-alives. On close/drop/error it tears the socket down and reconnects
+    with exponential backoff, RE-SUBSCRIBING with the (advanced) cursors.
+
+    ``client_factory(host, port) -> ClientTls`` is injectable so the framing/handshake is testable
+    with a fake ClientTls; the default builds a real ``ClientTls`` on port 443."""
+
+    def __init__(self, *, hab, eid, url, subscribe_builder, scheduler, retry_ms=1000,
+                 ping_ms=DEFAULT_PING_MS, client_factory=None):
         self.hab = hab
         self.eid = eid
         self.url = url
         self.subscribe_builder = subscribe_builder
-        self.retry_ms = retry_ms
+        self.scheduler = scheduler
+        self.retry_ms = max(retry_ms, 1)
         self.ping_ms = ping_ms
         self.nudges: queue.Queue = queue.Queue()
-        self._stop = threading.Event()
-        self._thread = None
-        self._connect_factory = connect_factory or _default_connect
+        self._client_factory = client_factory or _default_client_tls
 
-    def start(self):
-        self._thread = threading.Thread(target=self._run, name="mbx-ws-pump", daemon=True)
-        self._thread.start()
+        up = urlparse(url)
+        self.host = up.hostname
+        self.port = up.port or 443
+        self.path = up.path or "/"
+        if up.query:
+            self.path = f"{self.path}?{up.query}"
+
+        self.client = None
+        self.clientDoer = None
+        self._state = _ST_CLOSED
+        self._sec_key = ""            # base64 Sec-WebSocket-Key of the in-flight handshake
+        self._backoff_s = self.retry_ms / 1000.0
+        self._reconnect_at = 0.0      # monotonic time we may reconnect (backoff gate)
+        self._last_ping = 0.0
+        # Start disconnected; the first pump() opens the socket.
+        self._connect()
+
+    # -- connection lifecycle ----------------------------------------------------------------
+
+    def _connect(self):
+        """Build a fresh ClientTls + ClientDoer and schedule the doer on the host scheduler."""
+        try:
+            self.client = self._client_factory(self.host, self.port)
+            self.clientDoer = tcp_clienting.ClientDoer(client=self.client)
+            self.scheduler.extend([self.clientDoer])
+        except Exception as ex:   # noqa: BLE001 -- any connect setup failure -> backoff+retry
+            logger.error(f"ws connect setup to {self.host}:{self.port} failed: {ex}; backing off")
+            self._teardown()
+            self._schedule_reconnect()
+            return
+        self._state = _ST_CONNECTING
+        self._last_ping = _monotonic()
+
+    def _teardown(self):
+        """Remove the clientDoer from the scheduler and drop the socket."""
+        if self.clientDoer is not None:
+            try:
+                self.scheduler.remove([self.clientDoer])
+            except Exception:   # noqa: BLE001
+                pass
+        if self.client is not None:
+            try:
+                self.client.close()
+            except Exception:   # noqa: BLE001
+                pass
+        self.client = None
+        self.clientDoer = None
+        self._state = _ST_CLOSED
+
+    def _schedule_reconnect(self):
+        self._reconnect_at = _monotonic() + self._backoff_s
+        self._backoff_s = min(self._backoff_s * 2, _RECONNECT_CAP_MS / 1000.0)
 
     def stop(self):
-        self._stop.set()
-        t = self._thread
-        if t is not None and t.is_alive():
-            t.join(timeout=5.0)
+        self._teardown()
 
-    def _run(self):
-        backoff = max(self.retry_ms, 1) / 1000.0
-        while not self._stop.is_set():
-            try:
-                conn = self._connect_factory(self.url)
-            except Exception as ex:   # noqa: BLE001 -- reconnect on any connect failure
-                logger.error(f"ws connect to {self.url} failed: {ex}; backoff {backoff:.1f}s")
-                if self._stop.wait(backoff):
-                    return
-                backoff = min(backoff * 2, _RECONNECT_CAP_MS / 1000.0)
-                continue
+    # -- per-tick state machine --------------------------------------------------------------
 
-            backoff = max(self.retry_ms, 1) / 1000.0   # reset on a good connect
-            try:
-                conn.send(json.dumps(self.subscribe_builder()))   # (re)subscribe w/ current cursors
-                self._pump(conn)
-            except Exception as ex:   # noqa: BLE001 -- any drop -> reconnect+resubscribe
-                logger.info(f"ws pump loop ended for {self.url}: {ex}; reconnecting")
-            finally:
-                try:
-                    conn.close()
-                except Exception:   # noqa: BLE001
-                    pass
-            if self._stop.wait(backoff):
-                return
-            backoff = min(backoff * 2, _RECONNECT_CAP_MS / 1000.0)
-
-    def _pump(self, conn):
-        recv_timeout = min(self.ping_ms / 1000.0, 30.0)
-        last_ping = _monotonic()
-        while not self._stop.is_set():
-            try:
-                frame = conn.recv(timeout=recv_timeout)
-            except TimeoutError:
-                frame = None
-            if frame is not None:
-                self._handle_frame(frame)
-            if (_monotonic() - last_ping) * 1000.0 >= self.ping_ms:
-                conn.ping()                    # free keep-alive control frame
-                last_ping = _monotonic()
-
-    def _handle_frame(self, frame):
+    def pump(self):
+        """Advance the WS state machine one tick. Never raises (any error -> reconnect)."""
         try:
-            obj = json.loads(frame)
-        except (ValueError, TypeError):
-            logger.error(f"non-JSON ws frame ignored: {frame!r}")
+            self._pump()
+        except Exception as ex:   # noqa: BLE001 -- any WS-loop error -> reconnect+resubscribe
+            logger.info(f"ws pump error for {self.url}: {ex}; reconnecting")
+            self._teardown()
+            self._schedule_reconnect()
+
+    def _pump(self):
+        if self._state == _ST_CLOSED:
+            if _monotonic() >= self._reconnect_at:
+                self._connect()
+            return
+
+        client = self.client
+        if client is None:
+            self._state = _ST_CLOSED
+            return
+
+        # Detect a dropped socket (hio flags .cutoff on close/reset).
+        if getattr(client, "cutoff", False):
+            logger.info(f"ws socket cutoff for {self.url}; reconnecting")
+            self._teardown()
+            self._schedule_reconnect()
+            return
+
+        if self._state == _ST_CONNECTING:
+            if client.connected:
+                self._send_upgrade()
+                self._state = _ST_HANDSHAKE
+            return
+
+        if self._state == _ST_HANDSHAKE:
+            self._try_complete_handshake()
+            return
+
+        if self._state == _ST_OPEN:
+            self._read_frames()
+            # Periodic keep-alive ping (free control frame; server replies pong).
+            if (_monotonic() - self._last_ping) * 1000.0 >= self.ping_ms:
+                client.tx(_ws_frame(_OP_PING))
+                self._last_ping = _monotonic()
+
+    def _send_upgrade(self):
+        """Send the HTTP/1.1 Upgrade request that opens the WebSocket."""
+        self._sec_key = base64.b64encode(os.urandom(16)).decode("ascii")
+        host_hdr = self.host if self.port == 443 else f"{self.host}:{self.port}"
+        req = (
+            f"GET {self.path} HTTP/1.1\r\n"
+            f"Host: {host_hdr}\r\n"
+            f"Upgrade: websocket\r\n"
+            f"Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {self._sec_key}\r\n"
+            f"Sec-WebSocket-Version: 13\r\n"
+            f"\r\n"
+        )
+        self.client.tx(req.encode("ascii"))
+
+    def _try_complete_handshake(self):
+        """Read the 101 response from client.rxbs; verify Sec-WebSocket-Accept; go OPEN."""
+        rxbs = self.client.rxbs
+        end = rxbs.find(b"\r\n\r\n")
+        if end < 0:
+            return                              # headers not fully received yet
+        head = bytes(rxbs[:end]).decode("latin-1")
+        del rxbs[:end + 4]                      # consume the header block; body (if any) stays
+        lines = head.split("\r\n")
+        status_line = lines[0] if lines else ""
+        if "101" not in status_line:
+            raise ValueError(f"ws upgrade failed: {status_line!r}")
+        headers = {}
+        for line in lines[1:]:
+            if ":" in line:
+                k, v = line.split(":", 1)
+                headers[k.strip().lower()] = v.strip()
+        accept = headers.get("sec-websocket-accept", "")
+        expected = base64.b64encode(
+            hashlib.sha1((self._sec_key + _WS_GUID).encode("ascii")).digest()
+        ).decode("ascii")
+        if accept != expected:
+            raise ValueError("ws upgrade Sec-WebSocket-Accept mismatch")
+        # Handshake OK: reset backoff, subscribe with current cursors, start streaming.
+        self._backoff_s = self.retry_ms / 1000.0
+        self.client.tx(_ws_frame(_OP_TEXT, json.dumps(self.subscribe_builder()).encode("utf-8")))
+        self._last_ping = _monotonic()
+        self._state = _ST_OPEN
+        # Any bytes already buffered past the header may be the first frame(s).
+        self._read_frames()
+
+    def _read_frames(self):
+        """Parse WS frames from client.rxbs; dispatch text (nudge), ping->pong, pong, close."""
+        for opcode, payload in _parse_ws_frames(self.client.rxbs):
+            if opcode in (_OP_TEXT, _OP_CONT, _OP_BINARY):
+                self._handle_text(payload)
+            elif opcode == _OP_PING:
+                self.client.tx(_ws_frame(_OP_PONG, payload))
+            elif opcode == _OP_PONG:
+                pass                            # keep-alive acknowledged
+            elif opcode == _OP_CLOSE:
+                logger.info(f"ws close frame for {self.url}; reconnecting")
+                self._teardown()
+                self._schedule_reconnect()
+                return
+
+    def _handle_text(self, payload):
+        try:
+            obj = json.loads(payload.decode("utf-8"))
+        except (ValueError, TypeError, UnicodeDecodeError):
+            logger.error(f"non-JSON ws frame ignored: {payload!r}")
             return
         if isinstance(obj, dict) and obj.get("type") == "mailbox.nudge":
             self.nudges.put(obj)
 
 
-def _default_connect(url):
-    from websockets.sync.client import connect as ws_connect
-    return ws_connect(url)
+def _default_client_tls(host, port):
+    """Build a real non-blocking ClientTls for the given host:port (server-auth TLS)."""
+    return tcp_clienting.ClientTls(host=host, port=port)
 
 
-def _default_ws_factory(*, hab, eid, url, subscribe_builder, retry_ms, ping_ms):
-    return WsPump(hab=hab, eid=eid, url=url, subscribe_builder=subscribe_builder,
-                  retry_ms=retry_ms, ping_ms=ping_ms)
+def _default_ws_factory(*, hab, eid, url, subscribe_builder, retry_ms, ping_ms, scheduler):
+    return WsClient(hab=hab, eid=eid, url=url, subscribe_builder=subscribe_builder,
+                    scheduler=scheduler, retry_ms=retry_ms, ping_ms=ping_ms)

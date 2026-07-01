@@ -10,7 +10,7 @@ requires-python = ">=3.12"
 license = "Apache-2.0"
 readme = "README.md"
 authors = [{name = "Usurance"}]
-dependencies = ["keri", "hio", "websockets"]
+dependencies = ["keri", "hio"]
 classifiers = [
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",

@@ -1,13 +1,14 @@
 """Tests for the Serverless (WebSocket notify-and-fetch) strategy. NO real network.
 
-The generator (the tested unit) owns ALL scheduling/fetch logic; the WebSocket I/O is a
-thin, injectable pump. Tests inject a FAKE pump factory whose nudge queue is preloaded
+The generator (the tested unit) owns ALL scheduling/fetch logic; the WebSocket I/O is
+hio-native and INJECTABLE. Tests inject a FAKE WS source whose nudge queue is preloaded
 synchronously, so the hio generator is driven deterministically with no real socket and
-no thread-timing flakiness."""
+no thread. The real ``WsClient`` framing/handshake is unit-tested directly with a fake
+``ClientTls`` (no socket)."""
 import base64
+import hashlib
 import json
 import queue
-import time
 from types import SimpleNamespace
 
 from hio.base import doing
@@ -33,24 +34,25 @@ class _FakeScheduler:
     def remove(self, doers): self.removed.append(list(doers))
 
 
-class _FakePump:
-    """Injected in place of the real WS thread pump. Records subscribe envelopes and lets
-    the test push nudges onto the (thread-safe) queue synchronously; no real socket/thread."""
-    def __init__(self, *, hab, eid, url, subscribe_builder, retry_ms, ping_ms):
+class _FakeWs:
+    """Injected in place of the real hio-native WsClient. Records subscribe envelopes and lets
+    the test push nudges onto the queue synchronously; no real socket. ``pump()`` is called by
+    run_serverless each tick (a no-op here — the fake feeds nudges directly)."""
+    def __init__(self, *, hab, eid, url, subscribe_builder, retry_ms, ping_ms, scheduler):
         self.hab = hab
         self.eid = eid
         self.url = url
         self.subscribe_builder = subscribe_builder
         self.retry_ms = retry_ms
         self.ping_ms = ping_ms
+        self.scheduler = scheduler
         self.nudges = queue.Queue()
-        self.started = False
+        self.started = False               # set True on first pump() (mirrors "connected")
         self.stopped = False
-        self.subscribe_envelopes = []      # every envelope the pump would send
+        self.pumps = 0                     # how many times run_serverless serviced the WS
+        self.subscribe_envelopes = []      # every envelope the client would send
         self.connects = 0                  # how many times it (re)connected+subscribed
-
-    def start(self):
-        self.started = True
+        # Construction implies the first connect+subscribe (WsClient subscribes on handshake).
         self._connect()
 
     def _connect(self):
@@ -59,8 +61,12 @@ class _FakePump:
         self.subscribe_envelopes.append(self.subscribe_builder())
 
     def resubscribe(self):
-        """Simulate a reconnect: the pump re-sends the subscribe envelope w/ CURRENT cursors."""
+        """Simulate a reconnect: the client re-sends the subscribe envelope w/ CURRENT cursors."""
         self._connect()
+
+    def pump(self):
+        self.pumps += 1
+        self.started = True
 
     def push_nudge(self, pre, topic, cursor=None):
         self.nudges.put({"type": "mailbox.nudge", "pre": pre, "topic": topic, "cursor": cursor})
@@ -69,12 +75,12 @@ class _FakePump:
         self.stopped = True
 
 
-def _make_pump_factory():
+def _make_ws_factory():
     holder = {}
     def factory(**kwa):
-        pump = _FakePump(**kwa)
-        holder["pump"] = pump
-        return pump
+        ws = _FakeWs(**kwa)
+        holder["ws"] = ws
+        return ws
     return factory, holder
 
 
@@ -96,7 +102,7 @@ def _make_hab():
 
 def _drive(gen, holder, *, ticks, act=None, until=None):
     """Send None into the generator up to `ticks` times. `act(i)` runs each tick BEFORE the
-    send (to push nudges / close sockets); stop early when `until()` is true. Bounded so a
+    send (to push nudges / drop sockets); stop early when `until()` is true. Bounded so a
     bug can't hang the test."""
     for i in range(ticks):
         if act is not None:
@@ -115,7 +121,7 @@ def _drive(gen, holder, *, ticks, act=None, until=None):
 def test_subscribe_envelope_carries_signed_mbx_qry_with_current_cursors(monkeypatch):
     """The pump's subscribe envelope is action=subscribe and its qry base64-decodes to a
     signed /mbx qry built from the current cursors (seen+1, or 0 if unseen)."""
-    factory, holder = _make_pump_factory()
+    factory, holder = _make_ws_factory()
     # /credential seen at 4 -> query from 5; /receipt unseen -> query from 0.
     cur = _FakeCursorStore(seed={("Embx", "/credential"): 4})
     sched = _FakeScheduler()
@@ -126,11 +132,11 @@ def test_subscribe_envelope_carries_signed_mbx_qry_with_current_cursors(monkeypa
         on_message=lambda t, r: None, cursor_store=cur, retry_ms=1,
         scheduler=sched, ws_factory=factory, safety_net_ms=10_000_000, ping_ms=1_000_000)
 
-    _drive(gen, holder, ticks=3, until=lambda: holder.get("pump") and holder["pump"].started)
+    _drive(gen, holder, ticks=3, until=lambda: holder.get("ws") and holder["ws"].started)
 
-    pump = holder["pump"]
-    assert pump.started
-    env = pump.subscribe_envelopes[0]
+    ws = holder["ws"]
+    assert ws.started
+    env = ws.subscribe_envelopes[0]
     assert env["action"] == "subscribe"
     decoded = base64.b64decode(env["qry"])
     assert decoded.startswith(b"SIGNED-MBX-QRY:")
@@ -149,7 +155,7 @@ def test_nudge_triggers_exactly_one_fetch_and_advances_cursor(monkeypatch):
     building cursor key ("Embx","credential") and qry topic "credential" => server miss).
     GREEN after the fix (any nudge => re-drain subscribed ("/credential") past their cursors)."""
     received = []
-    factory, holder = _make_pump_factory()
+    factory, holder = _make_ws_factory()
     cur = _FakeCursorStore()
     sched = _FakeScheduler()
 
@@ -176,10 +182,10 @@ def test_nudge_triggers_exactly_one_fetch_and_advances_cursor(monkeypatch):
         scheduler=sched, ws_factory=factory, safety_net_ms=10_000_000, ping_ms=1_000_000)
 
     def act(i):
-        if i == 2 and holder.get("pump"):
+        if i == 2 and holder.get("ws"):
             # Push a nudge with the BARE topic form (no slash) — this is what the server sends
             # (the /fwd modifier deposit bare form), which does NOT match "/credential".
-            holder["pump"].push_nudge("Ebob", "credential", cursor=7)
+            holder["ws"].push_nudge("Ebob", "credential", cursor=7)
     # Run WELL past the single nudge (no early stop) to prove no redundant fetches on idle ticks.
     _drive(gen, holder, ticks=60, act=act)
 
@@ -194,7 +200,7 @@ def test_nudge_triggers_exactly_one_fetch_and_advances_cursor(monkeypatch):
 def test_fetch_schedules_the_clientdoer_on_scheduler(monkeypatch):
     """PHASE-2 REGRESSION GUARD: a fetch that doesn't extend([clientDoer]) onto the host
     scheduler never flushes client.requests / reads client.events against a real mailbox."""
-    factory, holder = _make_pump_factory()
+    factory, holder = _make_ws_factory()
     cur = _FakeCursorStore()
     sched = _FakeScheduler()
     hab = _make_hab()
@@ -215,8 +221,8 @@ def test_fetch_schedules_the_clientdoer_on_scheduler(monkeypatch):
         scheduler=sched, ws_factory=factory, safety_net_ms=10_000_000, ping_ms=1_000_000)
 
     def act(i):
-        if i == 2 and holder.get("pump"):
-            holder["pump"].push_nudge("Ebob", "/credential")
+        if i == 2 and holder.get("ws"):
+            holder["ws"].push_nudge("Ebob", "/credential")
     _drive(gen, holder, ticks=60, act=act)
 
     assert sched.extended == [[the_doer]]   # the SAME clientDoer httpClient returned, scheduled ONCE
@@ -225,7 +231,7 @@ def test_fetch_schedules_the_clientdoer_on_scheduler(monkeypatch):
 
 def test_idle_with_no_nudge_does_not_fetch(monkeypatch):
     """Driving run with no nudge and no elapsed safety-net does NOT fetch (idle is cheap)."""
-    factory, holder = _make_pump_factory()
+    factory, holder = _make_ws_factory()
     cur = _FakeCursorStore()
     sched = _FakeScheduler()
     hab = _make_hab()
@@ -248,7 +254,7 @@ def test_idle_with_no_nudge_does_not_fetch(monkeypatch):
 
 def test_safety_net_fetch_fires_on_cadence_without_a_nudge(monkeypatch):
     """The infrequent safety-net fetch fires on its cadence even with zero nudges."""
-    factory, holder = _make_pump_factory()
+    factory, holder = _make_ws_factory()
     cur = _FakeCursorStore()
     sched = _FakeScheduler()
     hab = _make_hab()
@@ -278,7 +284,7 @@ def test_safety_net_fetch_fires_on_cadence_without_a_nudge(monkeypatch):
 
 def test_ws_close_triggers_reconnect_and_resubscribe_with_current_cursors(monkeypatch):
     """A WS close/drop reconnects and RE-SUBSCRIBES with the CURRENT (advanced) cursors."""
-    factory, holder = _make_pump_factory()
+    factory, holder = _make_ws_factory()
     cur = _FakeCursorStore(seed={("Embx", "/credential"): 2})
     sched = _FakeScheduler()
     hab = _make_hab()
@@ -290,23 +296,23 @@ def test_ws_close_triggers_reconnect_and_resubscribe_with_current_cursors(monkey
         hab=hab, eid="Embx", topics=["/credential"],
         on_message=lambda t, r: None, cursor_store=cur, retry_ms=1,
         scheduler=sched, ws_factory=factory, safety_net_ms=10_000_000, ping_ms=1_000_000)
-    _drive(gen, holder, ticks=3, until=lambda: holder.get("pump") and holder["pump"].started)
+    _drive(gen, holder, ticks=3, until=lambda: holder.get("ws") and holder["ws"].started)
 
-    pump = holder["pump"]
-    first = pump.subscribe_envelopes[0]
-    # Cursor advances (e.g. a fetch delivered 5), then the socket drops and the pump reconnects.
+    ws = holder["ws"]
+    first = ws.subscribe_envelopes[0]
+    # Cursor advances (e.g. a fetch delivered 5), then the socket drops and the client reconnects.
     cur.set("Embx", "/credential", 5)
-    pump.resubscribe()
+    ws.resubscribe()
 
-    assert pump.connects == 2
-    second = pump.subscribe_envelopes[1]
+    assert ws.connects == 2
+    second = ws.subscribe_envelopes[1]
     assert base64.b64decode(first["qry"]).find(b"'/credential': 3") != -1   # seed 2 -> +1
     assert base64.b64decode(second["qry"]).find(b"'/credential': 6") != -1  # advanced 5 -> +1
 
 
 def test_teardown_stops_the_pump(monkeypatch):
-    """Closing the generator signals the pump to stop (never leak the WS thread)."""
-    factory, holder = _make_pump_factory()
+    """Closing the generator signals the WS client to stop (tear the socket down)."""
+    factory, holder = _make_ws_factory()
     cur = _FakeCursorStore()
     sched = _FakeScheduler()
     hab = _make_hab()
@@ -315,71 +321,173 @@ def test_teardown_stops_the_pump(monkeypatch):
         hab=hab, eid="Embx", topics=["/credential"],
         on_message=lambda t, r: None, cursor_store=cur, retry_ms=1,
         scheduler=sched, ws_factory=factory, safety_net_ms=10_000_000, ping_ms=1_000_000)
-    _drive(gen, holder, ticks=3, until=lambda: holder.get("pump") and holder["pump"].started)
+    _drive(gen, holder, ticks=3, until=lambda: holder.get("ws") and holder["ws"].started)
 
-    assert holder["pump"].stopped is True
+    assert holder["ws"].stopped is True
 
 
-# --- Real WsPump I/O logic, driven with a FAKE connection (no real socket / no flakiness) ---
+# --- Real hio-native WsClient I/O, driven with a FAKE ClientTls (no real socket) ------------
 
-class _FakeConn:
-    """A fake websockets sync connection: yields pre-scripted frames from recv() then stops the
-    pump. Records what was sent + whether it was closed. No network, no thread timing games."""
-    def __init__(self, frames, stop_event):
-        self._frames = list(frames)
-        self._stop = stop_event
-        self.sent = []
+class _FakeClientTls:
+    """A fake hio ClientTls: TX goes onto ``self.txbs`` (what the client sent over the wire);
+    ``self.rxbs`` is the byte buffer the client parses. The test flips ``.connected`` and feeds
+    ``.rxbs`` to drive the WS state machine deterministically — no socket, no Doist needed."""
+    def __init__(self):
+        self.txbs = bytearray()      # bytes the WsClient .tx()'d (readable by the test)
+        self.rxbs = bytearray()      # bytes the "server" sent (writable by the test)
+        self.connected = False       # TLS-connected flag (test flips it)
+        self.cutoff = False
         self.closed = False
-        self.pinged = 0
-    def send(self, s): self.sent.append(s)
-    def recv(self, timeout=None):
-        if self._frames:
-            return self._frames.pop(0)
-        self._stop.set()           # frames exhausted -> let the pump loop exit deterministically
-        raise TimeoutError()
-    def ping(self): self.pinged += 1
+    def tx(self, data): self.txbs.extend(data)
+    def feed(self, data): self.rxbs.extend(data)
     def close(self): self.closed = True
 
 
-def test_wspump_subscribes_and_parses_nudge_frames():
-    """The real WsPump sends the subscribe envelope on connect and pushes only mailbox.nudge
-    frames onto its queue (a non-nudge frame is ignored). Exercised via an injected fake conn."""
+def _server_ws_frame(opcode, payload=b""):
+    """Encode a SERVER->client frame (UNMASKED per RFC 6455) for feeding the fake socket."""
+    import struct as _struct
+    b0 = 0x80 | (opcode & 0x0F)
+    n = len(payload)
+    header = bytearray([b0])
+    if n < 126:
+        header.append(n)
+    elif n < (1 << 16):
+        header.append(126)
+        header.extend(_struct.pack("!H", n))
+    else:
+        header.append(127)
+        header.extend(_struct.pack("!Q", n))
+    return bytes(header) + payload
+
+
+def _server_101(sec_key):
+    """Build the server's 101 Switching Protocols response for the client's Sec-WebSocket-Key."""
+    accept = base64.b64encode(
+        hashlib.sha1((sec_key + serverless._WS_GUID).encode("ascii")).digest()
+    ).decode("ascii")
+    return (
+        "HTTP/1.1 101 Switching Protocols\r\n"
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        f"Sec-WebSocket-Accept: {accept}\r\n"
+        "\r\n"
+    ).encode("latin-1")
+
+
+def test_wsclient_handshake_subscribe_and_parses_nudge_frames():
+    """The real hio-native WsClient does the HTTP Upgrade, verifies the 101 accept, sends the
+    subscribe envelope as a MASKED text frame, then parses server frames: pushes only
+    mailbox.nudge onto its queue (non-nudge + non-JSON ignored) and replies PONG to a PING."""
     hab = _make_hab()
     def sub_builder():
         return {"action": "subscribe", "qry": base64.b64encode(b"QRY").decode("ascii")}
 
-    made = {}
-    def connect_factory(url):
-        conn = _FakeConn(
-            frames=[json.dumps({"type": "mailbox.nudge", "pre": "Ebob", "topic": "/credential"}),
-                    json.dumps({"type": "something.else"}),   # ignored (not a nudge)
-                    "not-json"],                              # ignored (non-JSON), logged
-            stop_event=made["stop"])
-        made["conn"] = conn
-        return conn
+    sched = _FakeScheduler()
+    fake = _FakeClientTls()
+    ws = serverless.WsClient(
+        hab=hab, eid="Embx", url="wss://mailbox.example/prod",
+        subscribe_builder=sub_builder, scheduler=sched, retry_ms=1, ping_ms=1_000_000,
+        client_factory=lambda host, port: fake)
 
-    pump = serverless.WsPump(hab=hab, eid="Embx", url="wss://mailbox.example/prod",
-                             subscribe_builder=sub_builder, retry_ms=1, ping_ms=1_000_000,
-                             connect_factory=connect_factory)
-    made["stop"] = pump._stop
-    pump.start()
-    # Wait (bounded) for the pump to process frames + exit its loop; then stop/join.
-    made_conn = None
-    for _ in range(200):
-        made_conn = made.get("conn")
-        if made_conn is not None and made_conn.closed:
-            break
-        time.sleep(0.01)
-    pump.stop()
+    # The clientDoer was scheduled on the host scheduler (host Doist services the ClientTls).
+    assert sched.extended and sched.extended[0][0] is ws.clientDoer
 
-    assert made_conn is not None
-    # Subscribe envelope sent on connect.
-    assert json.loads(made_conn.sent[0])["action"] == "subscribe"
-    # Exactly ONE nudge queued (the non-nudge and the non-JSON frame were ignored).
-    n = pump.nudges.get_nowait()
+    # Tick 1: not connected yet -> nothing sent.
+    ws.pump()
+    assert bytes(fake.txbs) == b""
+
+    # Tick 2: TLS connects -> WsClient sends the HTTP Upgrade GET.
+    fake.connected = True
+    ws.pump()
+    upgrade = bytes(fake.txbs).decode("latin-1")
+    assert upgrade.startswith("GET /prod HTTP/1.1\r\n")
+    assert "Upgrade: websocket\r\n" in upgrade
+    assert "Sec-WebSocket-Version: 13\r\n" in upgrade
+    sec_key = ws._sec_key
+    assert sec_key                      # a 16-byte base64 key was generated
+
+    # Server returns 101, then a nudge frame, a non-nudge frame, a non-JSON frame, and a PING.
+    fake.txbs.clear()
+    fake.feed(_server_101(sec_key))
+    fake.feed(_server_ws_frame(serverless._OP_TEXT,
+              json.dumps({"type": "mailbox.nudge", "pre": "Ebob", "topic": "/credential"}).encode()))
+    fake.feed(_server_ws_frame(serverless._OP_TEXT, json.dumps({"type": "something.else"}).encode()))
+    fake.feed(_server_ws_frame(serverless._OP_TEXT, b"not-json"))
+    fake.feed(_server_ws_frame(serverless._OP_PING, b"pingpayload"))
+
+    # Tick 3: complete handshake (sends masked subscribe) + parse all buffered frames.
+    ws.pump()
+
+    # Subscribe + PONG were sent as MASKED client frames (client MUST mask per RFC 6455).
+    sent = bytes(fake.txbs)
+    assert sent, "no subscribe frame sent after handshake"
+    frames = _split_client_frames(sent)
+    # First client frame after the 101 is the subscribe TEXT, masked.
+    assert (frames[0][0] & 0x0F) == serverless._OP_TEXT
+    assert frames[0][1] is True                          # mask bit set
+    assert json.loads(frames[0][2].decode("utf-8"))["action"] == "subscribe"
+
+    # Exactly ONE nudge queued (non-nudge + non-JSON ignored).
+    n = ws.nudges.get_nowait()
     assert n["type"] == "mailbox.nudge" and n["topic"] == "/credential"
-    assert pump.nudges.empty()
-    assert made_conn.closed is True
+    assert ws.nudges.empty()
+
+    # A PONG (opcode 0xA) was sent, masked, echoing the PING payload.
+    pongs = [f for f in frames if (f[0] & 0x0F) == serverless._OP_PONG]
+    assert pongs, "no PONG sent in reply to PING"
+    assert pongs[0][1] is True                           # masked
+    assert pongs[0][2] == b"pingpayload"                 # echoed the ping payload
+
+    scheduled_doer = ws.clientDoer          # capture before teardown nulls it
+    ws.stop()
+    assert fake.closed is True
+    assert sched.removed and sched.removed[0][0] is scheduled_doer   # clientDoer unscheduled
+
+
+def _split_client_frames(buf):
+    """Return [(b0, masked_bool, unmasked_payload)] for each client frame in buf. Client frames
+    are masked; this unmasks the payload so the test can assert on its content."""
+    import struct as _struct
+    out = []
+    i = 0
+    b = bytes(buf)
+    while i + 2 <= len(b):
+        b0 = b[i]
+        length = b[i + 1] & 0x7F
+        masked = (b[i + 1] & 0x80) != 0
+        j = i + 2
+        if length == 126:
+            length = _struct.unpack("!H", b[j:j + 2])[0]; j += 2
+        elif length == 127:
+            length = _struct.unpack("!Q", b[j:j + 8])[0]; j += 8
+        mask = b""
+        if masked:
+            mask = b[j:j + 4]; j += 4
+        payload = bytearray(b[j:j + length])
+        if masked:
+            payload = bytes(p ^ mask[k & 3] for k, p in enumerate(payload))
+        out.append((b0, masked, bytes(payload)))
+        i = j + length
+    return out
+
+
+def test_wsclient_upgrade_failure_reconnects(monkeypatch):
+    """A non-101 upgrade response tears down + schedules a reconnect (no crash)."""
+    hab = _make_hab()
+    sched = _FakeScheduler()
+    fake = _FakeClientTls()
+    ws = serverless.WsClient(
+        hab=hab, eid="Embx", url="wss://mailbox.example/prod",
+        subscribe_builder=lambda: {"action": "subscribe", "qry": "x"},
+        scheduler=sched, retry_ms=1, ping_ms=1_000_000,
+        client_factory=lambda host, port: fake)
+
+    fake.connected = True
+    ws.pump()                                   # sends upgrade
+    fake.feed(b"HTTP/1.1 500 Server Error\r\n\r\n")
+    ws.pump()                                   # sees non-101 -> teardown + backoff
+    assert fake.closed is True
+    assert ws._state == serverless._ST_CLOSED   # awaiting reconnect backoff
 
 
 # ---------------------------------------------------------------------------------------
