@@ -359,3 +359,193 @@ def test_wspump_subscribes_and_parses_nudge_frames():
     assert n["type"] == "mailbox.nudge" and n["topic"] == "/credential"
     assert pump.nudges.empty()
     assert made_conn.closed is True
+
+
+# ---------------------------------------------------------------------------------------
+# I-1: fetch_once drain-termination hardening — quiet-floor + hard-cap tests.
+# These drive fetch_once directly (not via run_serverless) for precision.
+
+import collections as _collections
+from keri_serverless_mailbox import fetch as _fetch_mod
+
+
+def _make_ticking_client(event_batches):
+    """Returns a fake (client, clientDoer) pair whose .events are fed batch-by-batch: each call
+    to _tick() pops the next batch into client.events. This lets the test control when events
+    appear during the drain without real wall-clock delays."""
+    client = SimpleNamespace(requests=[], events=_collections.deque())
+    clientDoer = doing.Doer()
+    client._batches = list(event_batches)
+    return client, clientDoer
+
+
+def _drive_fetch_once(gen, client, *, ticks, clock_adv_per_tick=0.0, clock=None):
+    """Drive fetch_once up to `ticks` yields. After each yield, optionally advance the fake
+    monotonic clock and pop the next event batch into client.events."""
+    for i in range(ticks):
+        if clock is not None:
+            clock["t"] += clock_adv_per_tick
+        if client._batches:
+            batch = client._batches.pop(0)
+            client.events.extend(batch)
+        try:
+            gen.send(None)
+        except StopIteration:
+            break
+    else:
+        gen.close()
+
+
+def _evt(idx, topic="/credential", data="AAAA"):
+    return {"id": str(idx), "name": topic, "data": data}
+
+
+def test_quiet_floor_prevents_premature_termination(monkeypatch):
+    """Events arrive, then a gap where wall-clock < QUIET_FLOOR (simulated), then more events.
+    fetch_once must NOT terminate during the sub-quiet-floor gap: all events are delivered."""
+    received = []
+    cur = _FakeCursorStore()
+    sched = _FakeScheduler()
+
+    clock = {"t": 0.0}
+    monkeypatch.setattr(_fetch_mod, "_monotonic", lambda: clock["t"])
+
+    # Batch 0: events 1 & 2 arrive at t=0
+    # Batch 1: empty (simulated gap) — clock at t=0.10 < QUIET_FLOOR (0.25)
+    # Batch 2: events 3 & 4 arrive at t=0.20 (still within quiet window from last event)
+    # Batch 3: empty (now clock will advance past quiet floor)
+    event_batches = [
+        [_evt(1), _evt(2)],           # tick 0: two events
+        [],                            # tick 1: nothing (gap, clock t=0.10)
+        [_evt(3), _evt(4)],           # tick 2: more events (gap was <0.25s)
+        [],                            # tick 3: nothing; now advance clock past quiet floor
+    ]
+    client, clientDoer = _make_ticking_client(event_batches)
+
+    def fake_httpClient(hab_, eid_):
+        return client, clientDoer
+    monkeypatch.setattr(_fetch_mod.agenting, "httpClient", fake_httpClient)
+    monkeypatch.setattr(_fetch_mod.httping, "createCESRRequest", lambda msg, c, dest=None: None)
+
+    hab = _make_hab()
+
+    def clock_adv(i):
+        # Advance clock 0.10s per tick up through tick 2 (gap is 0.10 < 0.25);
+        # after tick 3 (all events delivered), jump past quiet floor.
+        if i <= 2:
+            clock["t"] += 0.10
+        else:
+            clock["t"] += 0.30   # now past quiet floor => drain should complete
+
+    gen = _fetch_mod.fetch_once(
+        hab=hab, eid="Embx", topics=["/credential"],
+        on_message=lambda t, r: received.append((t, r)),
+        cursor_store=cur, scheduler=sched)
+
+    for i in range(30):
+        clock_adv(i)
+        if client._batches:
+            batch = client._batches.pop(0)
+            client.events.extend(batch)
+        try:
+            gen.send(None)
+        except StopIteration:
+            break
+    else:
+        gen.close()
+
+    # ALL four events must have been delivered — no premature termination during the gap.
+    assert len(received) == 4
+    assert [r[1] for r in received] == [b"AAAA", b"AAAA", b"AAAA", b"AAAA"]
+
+
+def test_drain_completes_after_quiet_floor(monkeypatch):
+    """Once QUIET_FLOOR_S of wall-clock quiet elapses with no new events, fetch_once returns."""
+    received = []
+    cur = _FakeCursorStore()
+    sched = _FakeScheduler()
+
+    clock = {"t": 0.0}
+    monkeypatch.setattr(_fetch_mod, "_monotonic", lambda: clock["t"])
+
+    # Two events arrive immediately; then silence. Clock advances past quiet floor => should stop.
+    event_batches = [
+        [_evt(1), _evt(2)],   # arrives at tick 0
+    ]
+    client, clientDoer = _make_ticking_client(event_batches)
+
+    def fake_httpClient(hab_, eid_):
+        return client, clientDoer
+    monkeypatch.setattr(_fetch_mod.agenting, "httpClient", fake_httpClient)
+    monkeypatch.setattr(_fetch_mod.httping, "createCESRRequest", lambda msg, c, dest=None: None)
+
+    hab = _make_hab()
+    gen = _fetch_mod.fetch_once(
+        hab=hab, eid="Embx", topics=["/credential"],
+        on_message=lambda t, r: received.append((t, r)),
+        cursor_store=cur, scheduler=sched)
+
+    stopped = False
+    for i in range(30):
+        clock["t"] += 0.10   # 0.10s/tick; quiet floor = 0.25s => should stop within ~3 ticks of silence
+        if client._batches:
+            batch = client._batches.pop(0)
+            client.events.extend(batch)
+        try:
+            gen.send(None)
+        except StopIteration:
+            stopped = True
+            break
+    else:
+        gen.close()
+
+    assert stopped, "fetch_once did not return after quiet floor elapsed"
+    assert len(received) == 2   # both events delivered before quiet
+    assert sched.extended and sched.removed  # extend/remove lifecycle preserved
+
+
+def test_hard_cap_bounds_a_never_quiet_fetch(monkeypatch):
+    """A fake client that yields one event every pass without ever going quiet must be stopped
+    at the hard cap (_FETCH_CAP_S). fetch_once must return (not loop forever)."""
+    received = []
+    cur = _FakeCursorStore()
+    sched = _FakeScheduler()
+
+    clock = {"t": 0.0}
+    monkeypatch.setattr(_fetch_mod, "_monotonic", lambda: clock["t"])
+
+    # Infinite-ish stream: we rely on the hard cap to stop it. Each tick: push one event AND
+    # advance the clock by 1s so the cap (30s) is hit in about 30 ticks.
+    client = SimpleNamespace(requests=[], events=_collections.deque(), _batches=[])
+    clientDoer = doing.Doer()
+
+    def fake_httpClient(hab_, eid_):
+        return client, clientDoer
+    monkeypatch.setattr(_fetch_mod.agenting, "httpClient", fake_httpClient)
+    monkeypatch.setattr(_fetch_mod.httping, "createCESRRequest", lambda msg, c, dest=None: None)
+
+    hab = _make_hab()
+    gen = _fetch_mod.fetch_once(
+        hab=hab, eid="Embx", topics=["/credential"],
+        on_message=lambda t, r: received.append((t, r)),
+        cursor_store=cur, scheduler=sched)
+
+    next_idx = [0]
+    stopped = False
+    # Drive 200 ticks max; the cap (30s @ 1s/tick) should fire around tick 30.
+    for i in range(200):
+        clock["t"] += 1.0                            # advance 1s/tick
+        client.events.append(_evt(next_idx[0]))      # always a new event (never goes quiet)
+        next_idx[0] += 1
+        try:
+            gen.send(None)
+        except StopIteration:
+            stopped = True
+            break
+    else:
+        gen.close()
+
+    assert stopped, "fetch_once did not return at the hard cap — unbounded loop"
+    # The fetch was bounded: far fewer than 200 ticks delivered.
+    assert len(received) < 100, f"too many events delivered ({len(received)}); cap not enforced"
+    assert sched.extended and sched.removed   # extend/remove lifecycle still clean

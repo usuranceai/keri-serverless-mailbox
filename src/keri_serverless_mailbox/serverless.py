@@ -91,6 +91,8 @@ def run_serverless(*, hab, eid, topics, on_message, cursor_store, retry_ms=1000,
                 if topic:
                     fetch_topics.add(topic)
                 else:
+                    # Intentional: a topic-less nudge (server doesn't know which topic changed)
+                    # fans out to ALL subscribed topics so nothing is missed.
                     fetch_topics.update(topics)   # topic-less nudge => refetch all
 
             # Safety-net: an infrequent backstop to catch a missed nudge.

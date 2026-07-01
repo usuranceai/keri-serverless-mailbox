@@ -14,12 +14,25 @@ serverless one-shot termination here; ``run_standard`` keeps its own 30s window 
 from __future__ import annotations
 
 import sys
+import time
 import traceback
 
 from keri.app import agenting, httping
 from keri import help, kering
 
 logger = help.ogler.getLogger(__name__)
+
+# Indirected through the module so tests can monkeypatch a deterministic clock.
+_monotonic = time.monotonic
+
+# Quiet-floor: how long wall-clock quiet (no new events) the drain loop waits before declaring
+# the backlog exhausted. Mirrors run_standard's yield 0.25 cadence.
+_QUIET_FLOOR_S = 0.25
+
+# Hard cap on the total wall-clock time a single fetch_once drain may spend. If the server
+# trickles events without going quiet, we stop at the cap and let the next nudge / 5-min
+# safety-net resume from the advanced cursor.
+_FETCH_CAP_S = 30.0
 
 
 def build_qtopics(eid, topics, cursor_store):
@@ -65,10 +78,17 @@ def fetch_once(*, hab, eid, topics, on_message, cursor_store, scheduler):
 
     Schedules the httpClient clientDoer on ``scheduler`` (extend/remove) exactly like
     ``run_standard`` — this is what makes the fetch actually flush over the wire; the Phase-2
-    regression was a fetch that never scheduled. Drains-and-stops (the Task-3 server closes the
-    response once the backlog is exhausted): reads events until, after requests have flushed,
-    the event queue is empty on a fresh service pass."""
-    tock = 0.0
+    regression was a fetch that never scheduled.
+
+    **Drain termination — §5.4 drain-and-close contract assumed:**
+    The Task-3 server closes the SSE response once the backlog is exhausted. hio's
+    ``client.responses`` does not expose a clean end-of-stream signal, so termination is driven
+    by a QUIET-FLOOR heuristic: the drain is considered complete once ``_QUIET_FLOOR_S`` seconds
+    of wall-clock time have elapsed with no new events in ``client.events``. A ``_FETCH_CAP_S``
+    hard cap bounds the total fetch wall-clock in case a server trickles events indefinitely
+    without going quiet (on cap, the fetch returns and the next nudge / 5-min safety-net re-drains
+    from the advanced cursor). Both thresholds are confirmed correct via the live e2e."""
+    tock = _QUIET_FLOOR_S
     try:
         client, clientDoer = agenting.httpClient(hab, eid)
     except kering.MissingEntryError as ex:
@@ -82,24 +102,41 @@ def fetch_once(*, hab, eid, topics, on_message, cursor_store, scheduler):
         while client.requests:        # wait for the signed qry to flush over the wire
             yield tock
 
-        # Drain: read events until the response is exhausted. The server drains-and-closes, so
-        # once requests are done AND no more events arrive on a service pass, the drain is over.
-        idle_passes = 0
+        # Drain: read events until quiet-floor or the hard cap.
+        fetch_start = _monotonic()
+        last_event_t = _monotonic()   # quiet measured from drain entry when no events yet
         while True:
-            drained_any = False
+            now = _monotonic()
+
+            # Hard cap: a trickling-forever server must not spin indefinitely.
+            if now - fetch_start >= _FETCH_CAP_S:
+                logger.info(
+                    f"fetch_once hard cap ({_FETCH_CAP_S}s) reached for {eid}; "
+                    f"stopping drain — next nudge/safety-net will resume from cursor"
+                )
+                return   # finally block still runs (scheduler.remove)
+
+            # Deliver all events queued so far in this service pass.
+            # Also check the hard cap inside this loop: if the server trickles one event per
+            # pass indefinitely the outer cap check is never reached from inside here.
+            delivered_any = False
             while client.events:
+                if _monotonic() - fetch_start >= _FETCH_CAP_S:
+                    logger.info(
+                        f"fetch_once hard cap ({_FETCH_CAP_S}s) reached for {eid}; "
+                        f"stopping drain — next nudge/safety-net will resume from cursor"
+                    )
+                    return
                 evt = client.events.popleft()
                 deliver_event(evt, on_message=on_message, cursor_store=cursor_store, eid=eid)
-                drained_any = True          # a frame arrived => the drain isn't finished
+                last_event_t = _monotonic()   # reset quiet clock on every delivered event
+                delivered_any = True
                 yield tock
-            if drained_any:
-                idle_passes = 0
-            else:
-                idle_passes += 1
-                # No events this pass. Give the client one more service pass to confirm the
-                # drain is truly empty (the response has closed), then stop.
-                if idle_passes >= 2:
-                    break
+
+            # Quiet-floor check: if no event arrived for _QUIET_FLOOR_S, the drain is done.
+            if not delivered_any and (_monotonic() - last_event_t) >= _QUIET_FLOOR_S:
+                break
+
             yield tock
     finally:
         scheduler.remove([clientDoer])    # one-shot done: stop servicing this clientDoer
