@@ -344,11 +344,13 @@ class _FakeClientTls:
     def close(self): self.closed = True
 
 
-def _server_ws_frame(opcode, payload=b""):
-    """Encode a SERVER->client frame (UNMASKED per RFC 6455) for feeding the fake socket."""
+def _server_ws_frame(opcode, payload=b"", fin=True, length_override=None):
+    """Encode a SERVER->client frame (UNMASKED per RFC 6455) for feeding the fake socket.
+    ``fin=False`` emits a non-final (fragment) frame. ``length_override`` writes a bogus advertised
+    length (for the oversize-frame test) without materializing that many payload bytes."""
     import struct as _struct
-    b0 = 0x80 | (opcode & 0x0F)
-    n = len(payload)
+    b0 = (0x80 if fin else 0x00) | (opcode & 0x0F)
+    n = length_override if length_override is not None else len(payload)
     header = bytearray([b0])
     if n < 126:
         header.append(n)
@@ -489,6 +491,156 @@ def test_wsclient_upgrade_failure_reconnects(monkeypatch):
     ws.pump()                                   # sees non-101 -> teardown + backoff
     assert fake.closed is True
     assert ws._state == serverless._ST_CLOSED   # awaiting reconnect backoff
+
+
+def _open_wsclient(fake, sched=None, sub_builder=None):
+    """Build a WsClient over the given fake ClientTls and drive it to the OPEN state
+    (TLS connected -> upgrade sent -> 101 accepted -> subscribe sent). Returns the WsClient."""
+    hab = _make_hab()
+    sub_builder = sub_builder or (lambda: {"action": "subscribe", "qry": "x"})
+    ws = serverless.WsClient(
+        hab=hab, eid="Embx", url="wss://mailbox.example/prod",
+        subscribe_builder=sub_builder, scheduler=sched or _FakeScheduler(),
+        retry_ms=1, ping_ms=1_000_000, client_factory=lambda host, port: fake)
+    fake.connected = True
+    ws.pump()                                   # CONNECTING -> send upgrade -> HANDSHAKE
+    fake.feed(_server_101(ws._sec_key))
+    ws.pump()                                   # HANDSHAKE -> verify 101 -> OPEN + subscribe
+    assert ws._state == serverless._ST_OPEN
+    fake.txbs.clear()                           # drop the subscribe frame so tests see only new tx
+    return ws
+
+
+def test_wsclient_frame_split_across_two_service_calls_parses_after_second():
+    """M-3: a nudge TEXT frame delivered SPLIT across two pump()/service passes (rxbs has only a
+    partial frame on the first pass) must buffer the partial and parse it on the second pass."""
+    fake = _FakeClientTls()
+    ws = _open_wsclient(fake)
+
+    frame = _server_ws_frame(serverless._OP_TEXT,
+        json.dumps({"type": "mailbox.nudge", "pre": "Ebob", "topic": "/credential"}).encode())
+    split = len(frame) // 2
+    assert 0 < split < len(frame)
+
+    fake.feed(frame[:split])                    # only the first half arrives this pass
+    ws.pump()
+    assert ws.nudges.empty()                    # partial frame: nothing parsed yet
+
+    fake.feed(frame[split:])                    # the rest arrives next pass
+    ws.pump()
+    n = ws.nudges.get_nowait()
+    assert n["type"] == "mailbox.nudge" and n["topic"] == "/credential"
+    assert ws.nudges.empty()
+
+
+def test_wsclient_16bit_length_frame_parses():
+    """M-3: a frame using the 126 (16-bit length) path parses (payload 126..65535 bytes)."""
+    fake = _FakeClientTls()
+    ws = _open_wsclient(fake)
+
+    # A nudge padded so its JSON payload is >125 bytes -> forces the 16-bit length header.
+    nudge = {"type": "mailbox.nudge", "pre": "Ebob", "topic": "/credential",
+             "pad": "x" * 200}
+    payload = json.dumps(nudge).encode()
+    assert len(payload) >= 126                   # exercises the 126 length path
+    frame = _server_ws_frame(serverless._OP_TEXT, payload)
+    assert frame[1] == 126                        # 16-bit length form in the header
+
+    fake.feed(frame)
+    ws.pump()
+    n = ws.nudges.get_nowait()
+    assert n["type"] == "mailbox.nudge" and n["topic"] == "/credential"
+
+
+def test_wsclient_fragmented_text_reassembles_into_one_nudge():
+    """M-3 / I-2: a nudge split into TEXT(FIN=0) + CONT(FIN=1) must reassemble into ONE nudge,
+    not be json.loads'd (and dropped) per half."""
+    fake = _FakeClientTls()
+    ws = _open_wsclient(fake)
+
+    body = json.dumps({"type": "mailbox.nudge", "pre": "Ebob", "topic": "/credential"}).encode()
+    half = len(body) // 2
+    # First half: TEXT, FIN=0 (message continues). Second half: CONT, FIN=1 (message ends).
+    fake.feed(_server_ws_frame(serverless._OP_TEXT, body[:half], fin=False))
+    fake.feed(_server_ws_frame(serverless._OP_CONT, body[half:], fin=True))
+    ws.pump()
+
+    n = ws.nudges.get_nowait()
+    assert n["type"] == "mailbox.nudge" and n["topic"] == "/credential"
+    assert ws.nudges.empty()                     # exactly one reassembled message
+
+
+def test_wsclient_binary_data_frame_is_dropped():
+    """M-1: a BINARY (0x2) data frame is NOT force-JSON'd; it is dropped (no nudge, no crash)."""
+    fake = _FakeClientTls()
+    ws = _open_wsclient(fake)
+    fake.feed(_server_ws_frame(serverless._OP_BINARY,
+        json.dumps({"type": "mailbox.nudge", "pre": "Ebob", "topic": "/credential"}).encode()))
+    ws.pump()
+    assert ws.nudges.empty()                     # BINARY dropped, not treated as a nudge
+
+
+def test_wsclient_oversize_frame_triggers_reconnect():
+    """M-2: a frame advertising a length beyond _MAX_FRAME on an OPEN socket tears down +
+    schedules a reconnect (rather than buffering forever / stalling into the phase timeout)."""
+    fake = _FakeClientTls()
+    ws = _open_wsclient(fake)
+
+    # Advertise a bogus huge length without sending that many bytes.
+    fake.feed(_server_ws_frame(serverless._OP_TEXT, b"", length_override=serverless._MAX_FRAME + 1))
+    ws.pump()
+    assert ws._state == serverless._ST_CLOSED    # torn down, awaiting reconnect backoff
+    assert fake.closed is True
+
+
+def test_wsclient_connecting_phase_timeout_reconnects(monkeypatch):
+    """I-1: a CONNECTING phase that never reaches TLS-connected must teardown + reconnect once
+    the phase deadline (driven via the _monotonic seam) elapses."""
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(serverless, "_monotonic", lambda: clock["t"])
+
+    hab = _make_hab()
+    sched = _FakeScheduler()
+    fake = _FakeClientTls()                       # .connected stays False forever
+    ws = serverless.WsClient(
+        hab=hab, eid="Embx", url="wss://mailbox.example/prod",
+        subscribe_builder=lambda: {"action": "subscribe", "qry": "x"},
+        scheduler=sched, retry_ms=1, ping_ms=1_000_000,
+        client_factory=lambda host, port: fake)
+    assert ws._state == serverless._ST_CONNECTING
+
+    ws.pump()                                     # still connecting, deadline not reached
+    assert ws._state == serverless._ST_CONNECTING
+
+    clock["t"] += serverless._PHASE_TIMEOUT_MS / 1000.0 + 1.0   # blow the deadline
+    ws.pump()
+    assert ws._state == serverless._ST_CLOSED     # timed out -> torn down, awaiting backoff
+    assert fake.closed is True
+
+
+def test_wsclient_handshake_phase_timeout_reconnects(monkeypatch):
+    """I-1: TLS connects and the upgrade is sent, but the server never returns the 101. Once the
+    HANDSHAKE deadline elapses the client tears down + reconnects (does not hang forever)."""
+    clock = {"t": 2000.0}
+    monkeypatch.setattr(serverless, "_monotonic", lambda: clock["t"])
+
+    hab = _make_hab()
+    sched = _FakeScheduler()
+    fake = _FakeClientTls()
+    ws = serverless.WsClient(
+        hab=hab, eid="Embx", url="wss://mailbox.example/prod",
+        subscribe_builder=lambda: {"action": "subscribe", "qry": "x"},
+        scheduler=sched, retry_ms=1, ping_ms=1_000_000,
+        client_factory=lambda host, port: fake)
+
+    fake.connected = True
+    ws.pump()                                     # CONNECTING -> send upgrade -> HANDSHAKE
+    assert ws._state == serverless._ST_HANDSHAKE
+    # No 101 is ever fed. Advance past the (freshly reset) HANDSHAKE deadline.
+    clock["t"] += serverless._PHASE_TIMEOUT_MS / 1000.0 + 1.0
+    ws.pump()
+    assert ws._state == serverless._ST_CLOSED
+    assert fake.closed is True
 
 
 # ---------------------------------------------------------------------------------------

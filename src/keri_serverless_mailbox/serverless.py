@@ -53,6 +53,19 @@ DEFAULT_PING_MS = 4 * 60 * 1000          # 4 min < 10-min idle timeout
 DEFAULT_SAFETY_NET_MS = 5 * 60 * 1000    # 5 min backstop
 _RECONNECT_CAP_MS = 30 * 1000            # exponential backoff cap
 
+# Liveness bound: max wall-clock a CONNECTING (TLS) or HANDSHAKE (awaiting 101) phase may hang
+# before we teardown + reconnect. Restores the bound the old thread pump had via recv timeout;
+# guards against a server that finishes TLS but never sends 101, or a half-open socket.
+_PHASE_TIMEOUT_MS = 12 * 1000
+
+# Nudges are tiny JSON; a frame advertising a huge length is bogus/hostile. Cap the accepted
+# payload length — a frame over this triggers teardown+reconnect rather than buffering forever
+# (which would otherwise collapse into the phase-timeout stall on an already-OPEN socket).
+_MAX_FRAME = 1 << 20                      # 1 MiB
+
+# Bound the non-JSON frame log so a garbage/huge payload can't spam the log with its full body.
+_LOG_PAYLOAD_CAP = 120
+
 # RFC 6455 GUID for the Sec-WebSocket-Accept handshake proof.
 _WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
@@ -179,15 +192,24 @@ def _ws_frame(opcode, payload=b""):
     return bytes(header) + masked
 
 
+class _OversizeFrame(Exception):
+    """A frame advertised a payload length beyond ``_MAX_FRAME``; caller must reconnect rather
+    than wait to buffer it."""
+
+
 def _parse_ws_frames(buf):
     """Parse as many complete server->client frames from ``buf`` (a bytearray) as are present.
-    Server frames are UNMASKED. Returns a list of ``(opcode, payload_bytes)`` and consumes the
-    parsed bytes from ``buf`` in place; a partial trailing frame is left for the next call."""
+    Server frames are UNMASKED. Returns a list of ``(fin, opcode, payload_bytes)`` and consumes
+    the parsed bytes from ``buf`` in place; a partial trailing frame is left for the next call.
+
+    Raises ``_OversizeFrame`` (without consuming) if a frame advertises a length > ``_MAX_FRAME``
+    — the header is enough to decide, so we needn't buffer the whole (bogus) body first."""
     frames = []
     while True:
         if len(buf) < 2:
             break
         b0, b1 = buf[0], buf[1]
+        fin = (b0 & 0x80) != 0
         opcode = b0 & 0x0F
         masked = (b1 & 0x80) != 0
         length = b1 & 0x7F
@@ -202,6 +224,8 @@ def _parse_ws_frames(buf):
                 break
             length = struct.unpack("!Q", bytes(buf[offset:offset + 8]))[0]
             offset += 8
+        if length > _MAX_FRAME:                 # decided from the header alone — don't buffer it
+            raise _OversizeFrame(f"ws frame length {length} exceeds cap {_MAX_FRAME}")
         mask = b""
         if masked:                              # servers shouldn't mask, but handle defensively
             if len(buf) < offset + 4:
@@ -214,7 +238,7 @@ def _parse_ws_frames(buf):
         if masked:
             payload = bytes(b ^ mask[i & 3] for i, b in enumerate(payload))
         del buf[:offset + length]
-        frames.append((opcode, payload))
+        frames.append((fin, opcode, payload))
     return frames
 
 
@@ -259,6 +283,10 @@ class WsClient:
         self._backoff_s = self.retry_ms / 1000.0
         self._reconnect_at = 0.0      # monotonic time we may reconnect (backoff gate)
         self._last_ping = 0.0
+        self._phase_deadline = 0.0    # monotonic deadline for the CONNECTING/HANDSHAKE phase
+        # Fragmentation reassembly: opcode of the in-flight data message + accumulated payload.
+        self._frag_opcode = None
+        self._frag_buf = bytearray()
         # Start disconnected; the first pump() opens the socket.
         self._connect()
 
@@ -277,6 +305,7 @@ class WsClient:
             return
         self._state = _ST_CONNECTING
         self._last_ping = _monotonic()
+        self._phase_deadline = _monotonic() + _PHASE_TIMEOUT_MS / 1000.0
 
     def _teardown(self):
         """Remove the clientDoer from the scheduler and drop the socket."""
@@ -293,6 +322,9 @@ class WsClient:
         self.client = None
         self.clientDoer = None
         self._state = _ST_CLOSED
+        # Drop any half-assembled fragmented message; a fresh connection restarts framing.
+        self._frag_opcode = None
+        self._frag_buf = bytearray()
 
     def _schedule_reconnect(self):
         self._reconnect_at = _monotonic() + self._backoff_s
@@ -330,10 +362,20 @@ class WsClient:
             self._schedule_reconnect()
             return
 
+        # Liveness bound for the pre-OPEN phases: a server that finishes TLS but never sends 101
+        # (or a half-open socket) must not hang the client forever.
+        if self._state in (_ST_CONNECTING, _ST_HANDSHAKE) and _monotonic() >= self._phase_deadline:
+            logger.info(f"ws {self._state} phase timed out for {self.url}; reconnecting")
+            self._teardown()
+            self._schedule_reconnect()
+            return
+
         if self._state == _ST_CONNECTING:
             if client.connected:
                 self._send_upgrade()
                 self._state = _ST_HANDSHAKE
+                # Reset the deadline for the fresh HANDSHAKE phase (awaiting the 101).
+                self._phase_deadline = _monotonic() + _PHASE_TIMEOUT_MS / 1000.0
             return
 
         if self._state == _ST_HANDSHAKE:
@@ -394,11 +436,19 @@ class WsClient:
         self._read_frames()
 
     def _read_frames(self):
-        """Parse WS frames from client.rxbs; dispatch text (nudge), ping->pong, pong, close."""
-        for opcode, payload in _parse_ws_frames(self.client.rxbs):
-            if opcode in (_OP_TEXT, _OP_CONT, _OP_BINARY):
-                self._handle_text(payload)
-            elif opcode == _OP_PING:
+        """Parse WS frames from client.rxbs and dispatch. Data frames (TEXT/CONT/BINARY) are
+        reassembled by FIN before dispatch — a fragmented TEXT(FIN=0)+CONT(FIN=1) message is one
+        logical nudge. Control frames (ping/pong/close) are never fragmented and are handled
+        immediately, even if they interleave between data fragments (RFC 6455 §5.4)."""
+        try:
+            frames = _parse_ws_frames(self.client.rxbs)
+        except _OversizeFrame as ex:
+            logger.info(f"ws oversize frame for {self.url}: {ex}; reconnecting")
+            self._teardown()
+            self._schedule_reconnect()
+            return
+        for fin, opcode, payload in frames:
+            if opcode == _OP_PING:
                 self.client.tx(_ws_frame(_OP_PONG, payload))
             elif opcode == _OP_PONG:
                 pass                            # keep-alive acknowledged
@@ -407,12 +457,37 @@ class WsClient:
                 self._teardown()
                 self._schedule_reconnect()
                 return
+            elif opcode == _OP_CONT:
+                # Continuation of an in-flight data message.
+                if self._frag_opcode is None:
+                    logger.info("ws continuation frame with no message in progress; ignored")
+                    continue
+                self._frag_buf.extend(payload)
+                if fin:
+                    self._dispatch_message(self._frag_opcode, bytes(self._frag_buf))
+                    self._frag_opcode = None
+                    self._frag_buf = bytearray()
+            elif opcode in (_OP_TEXT, _OP_BINARY):
+                # Start of a data message.
+                if fin:
+                    self._dispatch_message(opcode, payload)   # unfragmented
+                else:
+                    self._frag_opcode = opcode                # begin reassembly
+                    self._frag_buf = bytearray(payload)
+            # any other (reserved) opcode: ignore
 
-    def _handle_text(self, payload):
+    def _dispatch_message(self, opcode, payload):
+        """Dispatch a COMPLETE (reassembled) data message. Only TEXT (0x1) can be a nudge;
+        BINARY (0x2) is not part of the nudge protocol and is dropped."""
+        if opcode != _OP_TEXT:                  # drop BINARY rather than force-JSON it (M-1)
+            logger.info(f"ws non-text data frame (opcode {opcode:#x}) dropped")
+            return
         try:
             obj = json.loads(payload.decode("utf-8"))
         except (ValueError, TypeError, UnicodeDecodeError):
-            logger.error(f"non-JSON ws frame ignored: {payload!r}")
+            head = payload[:_LOG_PAYLOAD_CAP]
+            suffix = "..." if len(payload) > _LOG_PAYLOAD_CAP else ""
+            logger.info(f"non-JSON ws frame ignored ({len(payload)} bytes): {head!r}{suffix}")
             return
         if isinstance(obj, dict) and obj.get("type") == "mailbox.nudge":
             self.nudges.put(obj)
