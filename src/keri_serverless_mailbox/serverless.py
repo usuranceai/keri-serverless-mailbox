@@ -119,6 +119,14 @@ def run_serverless(*, hab, eid, topics, on_message, cursor_store, retry_ms=1000,
 
     last_safety = _monotonic()
     try:
+        # Initial drain on load: check the mailbox once immediately. Parked mail whose nudge
+        # fired while the client was offline will not re-nudge, and the safety-net backstop is
+        # infrequent (5 min) -- so drain once up front. The fetch is an independent signed HTTP
+        # qry (no dependency on the WS being open yet) and is cursor-based, so it only pulls
+        # what is new.
+        yield from fetch_once(hab=hab, eid=eid, topics=topics,
+                              on_message=on_message, cursor_store=cursor_store,
+                              scheduler=scheduler)
         while True:
             nudge_received = False
 

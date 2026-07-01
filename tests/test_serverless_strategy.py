@@ -128,12 +128,22 @@ def test_subscribe_envelope_carries_signed_mbx_qry_with_current_cursors(monkeypa
     sched = _FakeScheduler()
     hab = _make_hab()
 
+    # The initial drain on connect now fires before the WS loop; mock httpClient so it is inert.
+    monkeypatch.setattr(fetch_mod.agenting, "httpClient",
+                        lambda hab_, eid_: _fake_http_client([]))
+    monkeypatch.setattr(fetch_mod.httping, "createCESRRequest", lambda msg, client, dest=None: None)
+    # Advance the fetch clock so the quiet floor elapses immediately (no real-time wait).
+    fetch_clock = {"t": 0.0}
+    monkeypatch.setattr(fetch_mod, "_monotonic", lambda: fetch_clock["t"])
+
     gen = serverless.run_serverless(
         hab=hab, eid="Embx", topics=["/credential", "/receipt"],
         on_message=lambda t, r: None, cursor_store=cur, retry_ms=1,
         scheduler=sched, ws_factory=factory, safety_net_ms=10_000_000, ping_ms=1_000_000)
 
-    _drive(gen, holder, ticks=3, until=lambda: holder.get("ws") and holder["ws"].started)
+    def advance_and_drive(i):
+        fetch_clock["t"] = i * 1.0   # 1s per tick >> 0.25s quiet floor; initial fetch completes fast
+    _drive(gen, holder, ticks=10, act=advance_and_drive, until=lambda: holder.get("ws") and holder["ws"].started)
 
     ws = holder["ws"]
     assert ws.started
@@ -230,27 +240,38 @@ def test_fetch_schedules_the_clientdoer_on_scheduler(monkeypatch):
     assert sched.removed == [[the_doer]]    # and removed when the one-shot drain completes
 
 
-def test_idle_with_no_nudge_does_not_fetch(monkeypatch):
-    """Driving run with no nudge and no elapsed safety-net does NOT fetch (idle is cheap)."""
+def test_idle_after_initial_drain_does_not_fetch_again(monkeypatch):
+    """After the one initial drain on connect, idle ticks (no nudge, no safety-net) produce NO
+    further fetches. The initial drain itself fires exactly once."""
     factory, holder = _make_ws_factory()
     cur = _FakeCursorStore()
     sched = _FakeScheduler()
     hab = _make_hab()
 
     calls = {"n": 0}
-    monkeypatch.setattr(fetch_mod.agenting, "httpClient",
-                        lambda hab_, eid_: (calls.__setitem__("n", calls["n"] + 1),
-                                            _fake_http_client([]))[1])
+    def fake_httpClient(hab_, eid_):
+        calls["n"] += 1
+        return _fake_http_client([])
+    monkeypatch.setattr(fetch_mod.agenting, "httpClient", fake_httpClient)
     monkeypatch.setattr(fetch_mod.httping, "createCESRRequest", lambda msg, client, dest=None: None)
+    # Advance the fetch clock so the initial fetch_once quiet floor elapses quickly.
+    fetch_clock = {"t": 0.0}
+    monkeypatch.setattr(fetch_mod, "_monotonic", lambda: fetch_clock["t"])
 
     gen = serverless.run_serverless(
         hab=hab, eid="Embx", topics=["/credential"],
         on_message=lambda t, r: None, cursor_store=cur, retry_ms=1,
         scheduler=sched, ws_factory=factory, safety_net_ms=10_000_000, ping_ms=1_000_000)
-    _drive(gen, holder, ticks=30)
 
-    assert calls["n"] == 0            # never fetched
-    assert sched.extended == []       # never scheduled a fetch clientDoer
+    def act(i):
+        fetch_clock["t"] = i * 1.0   # 1s per tick >> 0.25s quiet floor
+
+    _drive(gen, holder, ticks=30, act=act)
+
+    assert calls["n"] == 1            # exactly ONE initial drain; idle ticks add nothing
+    # The initial fetch's clientDoer was scheduled then removed; no second scheduling.
+    assert len(sched.extended) == 1   # one clientDoer for the initial drain
+    assert len(sched.removed) == 1    # and removed when the drain completed
 
 
 def test_safety_net_fetch_fires_on_cadence_without_a_nudge(monkeypatch):
@@ -281,6 +302,36 @@ def test_safety_net_fetch_fires_on_cadence_without_a_nudge(monkeypatch):
     _drive(gen, holder, ticks=15, act=act, until=lambda: calls["n"] >= 1)
 
     assert calls["n"] >= 1            # safety-net fetched with no nudge
+
+
+def test_initial_drain_on_connect_fetches_once_without_a_nudge(monkeypatch):
+    """On client load, run_serverless drains the mailbox once immediately -- no nudge, and
+    with the safety-net effectively disabled."""
+    factory, holder = _make_ws_factory()
+    cur = _FakeCursorStore()
+    sched = _FakeScheduler()
+    hab = _make_hab()
+
+    fetches = []
+    def fake_httpClient(hab_, eid_):
+        fetches.append(1)
+        return _fake_http_client([])          # empty drain, still counts as a fetch
+    monkeypatch.setattr(fetch_mod.agenting, "httpClient", fake_httpClient)
+    monkeypatch.setattr(fetch_mod.httping, "createCESRRequest", lambda msg, client, dest=None: None)
+    # Advance the fetch clock so the quiet floor elapses quickly.
+    fetch_clock = {"t": 0.0}
+    monkeypatch.setattr(fetch_mod, "_monotonic", lambda: fetch_clock["t"])
+
+    gen = serverless.run_serverless(
+        hab=hab, eid="Embx", topics=["/credential"],
+        on_message=lambda t, r: None, cursor_store=cur, retry_ms=1,
+        scheduler=sched, ws_factory=factory, safety_net_ms=10_000_000, ping_ms=1_000_000)
+
+    def act(i):
+        fetch_clock["t"] = i * 1.0   # 1s per tick >> 0.25s quiet floor; fetch_once exits fast
+
+    _drive(gen, holder, ticks=6, act=act)              # NO nudge pushed
+    assert len(fetches) == 1, "expected exactly ONE initial drain on connect (no nudge)"
 
 
 def test_ws_close_triggers_reconnect_and_resubscribe_with_current_cursors(monkeypatch):
@@ -318,11 +369,23 @@ def test_teardown_stops_the_pump(monkeypatch):
     sched = _FakeScheduler()
     hab = _make_hab()
 
+    # The initial drain on connect now fires before the WS loop; mock httpClient so it is inert.
+    monkeypatch.setattr(fetch_mod.agenting, "httpClient",
+                        lambda hab_, eid_: _fake_http_client([]))
+    monkeypatch.setattr(fetch_mod.httping, "createCESRRequest", lambda msg, client, dest=None: None)
+    # Advance the fetch clock so the quiet floor elapses immediately.
+    fetch_clock = {"t": 0.0}
+    monkeypatch.setattr(fetch_mod, "_monotonic", lambda: fetch_clock["t"])
+
     gen = serverless.run_serverless(
         hab=hab, eid="Embx", topics=["/credential"],
         on_message=lambda t, r: None, cursor_store=cur, retry_ms=1,
         scheduler=sched, ws_factory=factory, safety_net_ms=10_000_000, ping_ms=1_000_000)
-    _drive(gen, holder, ticks=3, until=lambda: holder.get("ws") and holder["ws"].started)
+
+    def advance_clock(i):
+        fetch_clock["t"] = i * 1.0   # ensures initial fetch_once quiet floor elapses quickly
+
+    _drive(gen, holder, ticks=10, act=advance_clock, until=lambda: holder.get("ws") and holder["ws"].started)
 
     assert holder["ws"].stopped is True
 
