@@ -36,12 +36,18 @@ _FETCH_CAP_S = 30.0
 
 
 def build_qtopics(eid, topics, cursor_store):
-    """Per-topic query cursors: last-seen + 1, or 0 if never seen. Identical to what the
-    Poller / run_standard builds."""
+    """Per-topic query cursors = the LAST-SEEN ordinal (or -1 if never seen).
+
+    The mailbox drain iterates from cursor+1 — keripy's MailboxIterable AND our
+    _format_sse_events both do ``cloneTopicIter(fn=idx+1)`` — so the qry value must be the
+    last-seen ordinal and the SERVER does the single increment. Sending ``seen+1`` (or ``0``
+    when unseen) double-increments and skips the next (or, unseen, the very FIRST) message.
+    Confirmed live against mailbox.keri.host: a qry cursor of -1 drains ordinal 0; a cursor
+    of 0 drains nothing."""
     q_topics = {}
     for topic in topics:
         seen = cursor_store.get(eid, topic)
-        q_topics[topic] = (seen + 1) if seen is not None else 0
+        q_topics[topic] = seen if seen is not None else -1
     return q_topics
 
 

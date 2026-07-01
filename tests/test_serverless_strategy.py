@@ -120,9 +120,10 @@ def _drive(gen, holder, *, ticks, act=None, until=None):
 
 def test_subscribe_envelope_carries_signed_mbx_qry_with_current_cursors(monkeypatch):
     """The pump's subscribe envelope is action=subscribe and its qry base64-decodes to a
-    signed /mbx qry built from the current cursors (seen+1, or 0 if unseen)."""
+    signed /mbx qry built from the current cursors (LAST-SEEN ordinal, or -1 if unseen;
+    the server drains from cursor+1)."""
     factory, holder = _make_ws_factory()
-    # /credential seen at 4 -> query from 5; /receipt unseen -> query from 0.
+    # /credential seen at 4 -> qry cursor 4 (server drains from 5); /receipt unseen -> -1.
     cur = _FakeCursorStore(seed={("Embx", "/credential"): 4})
     sched = _FakeScheduler()
     hab = _make_hab()
@@ -142,8 +143,8 @@ def test_subscribe_envelope_carries_signed_mbx_qry_with_current_cursors(monkeypa
     assert decoded.startswith(b"SIGNED-MBX-QRY:")
     # The qry-build kwargs are embedded (our fake query echoes them): route=mbx, cursors applied.
     assert b"'route': 'mbx'" in decoded
-    assert b"'/credential': 5" in decoded    # seen 4 -> +1
-    assert b"'/receipt': 0" in decoded       # unseen -> 0
+    assert b"'/credential': 4" in decoded    # seen 4 -> last-seen (server drains from 5)
+    assert b"'/receipt': -1" in decoded      # unseen -> -1 (server drains from 0)
 
 
 def test_nudge_triggers_exactly_one_fetch_and_advances_cursor(monkeypatch):
@@ -306,8 +307,8 @@ def test_ws_close_triggers_reconnect_and_resubscribe_with_current_cursors(monkey
 
     assert ws.connects == 2
     second = ws.subscribe_envelopes[1]
-    assert base64.b64decode(first["qry"]).find(b"'/credential': 3") != -1   # seed 2 -> +1
-    assert base64.b64decode(second["qry"]).find(b"'/credential': 6") != -1  # advanced 5 -> +1
+    assert base64.b64decode(first["qry"]).find(b"'/credential': 2") != -1   # seed 2 -> last-seen
+    assert base64.b64decode(second["qry"]).find(b"'/credential': 5") != -1  # advanced 5 -> last-seen
 
 
 def test_teardown_stops_the_pump(monkeypatch):
