@@ -2,6 +2,7 @@ from types import SimpleNamespace
 from hio.base import doing
 
 from keri_serverless_mailbox import standard
+from keri_serverless_mailbox import fetch as fetch_mod   # createCESRRequest now lives in the shared fetch core
 
 
 class _FakeCursorStore:
@@ -34,7 +35,7 @@ def test_run_standard_delivers_events_and_advances_cursor(monkeypatch):
                 [{"id": "0", "name": "/credential", "data": "AAAA-cesr"}])
     fake_client, fake_doer = _Client(), doing.Doer()
     monkeypatch.setattr(standard.agenting, "httpClient", lambda hab, eid: (fake_client, fake_doer))
-    monkeypatch.setattr(standard.httping, "createCESRRequest", lambda msg, client, dest=None: None)
+    monkeypatch.setattr(fetch_mod.httping, "createCESRRequest", lambda msg, client, dest=None: None)
 
     hab = SimpleNamespace(pre="Edoi", query=lambda **kw: b"qry",
                           db=SimpleNamespace(tops=SimpleNamespace(get=lambda k: None)))
@@ -72,7 +73,7 @@ def test_run_standard_unschedules_clientdoer_when_window_ends(monkeypatch):
                 [{"id": "0", "name": "/credential", "data": "AAAA-cesr"}])
     fake_client, fake_doer = _Client(), doing.Doer()
     monkeypatch.setattr(standard.agenting, "httpClient", lambda hab, eid: (fake_client, fake_doer))
-    monkeypatch.setattr(standard.httping, "createCESRRequest", lambda msg, client, dest=None: None)
+    monkeypatch.setattr(fetch_mod.httping, "createCESRRequest", lambda msg, client, dest=None: None)
 
     # Force the 30s window to be "already elapsed" so the inner loop breaks on first check,
     # exercising scheduler.remove([clientDoer]) deterministically.

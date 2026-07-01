@@ -23,10 +23,13 @@ class Strategy(ABC):
 
 
 class ServerlessStrategy(Strategy):
-    """Phase 3: WebSocket notify-and-fetch. Selected when the mailbox advertises a wss loc."""
+    """Phase 3: WebSocket notify-and-fetch. Selected when the mailbox advertises a wss loc.
+    run() delegates to serverless.run_serverless (mirrors how StandardStrategy delegates)."""
     def run(self, *, hab, eid, topics, on_message, cursor_store, retry_ms=1000, scheduler):
-        raise NotImplementedError("Phase 3: WS notify-and-fetch")
-        yield  # pragma: no cover  (keeps this a generator function)
+        from .serverless import run_serverless
+        yield from run_serverless(hab=hab, eid=eid, topics=topics,
+                                  on_message=on_message, cursor_store=cursor_store,
+                                  retry_ms=retry_ms, scheduler=scheduler)
 
 
 class StandardStrategy(Strategy):

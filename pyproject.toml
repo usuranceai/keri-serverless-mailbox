@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "keri-serverless-mailbox"
-version = "0.1.0"
-description = "Universal KERI mailbox client: resolve via agenting.mailbox, discover capability from the KEL, run a swappable retrieval strategy (Standard SSE; Serverless WS in Phase 3)."
+version = "0.2.0"
+description = "Universal KERI mailbox client: resolve via agenting.mailbox, discover capability from the KEL, run a swappable retrieval strategy (Standard SSE; Serverless WebSocket notify-and-fetch)."
 requires-python = ">=3.12"
 license = "Apache-2.0"
 readme = "README.md"
 authors = [{name = "Usurance"}]
-dependencies = ["keri", "hio"]
+dependencies = ["keri", "hio", "websockets"]
 classifiers = [
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
@@ -19,8 +19,8 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/usurance/keri-serverless-mailbox"
-Repository = "https://github.com/usurance/keri-serverless-mailbox"
+Homepage = "https://github.com/usuranceai/keri-serverless-mailbox"
+Repository = "https://github.com/usuranceai/keri-serverless-mailbox"
 
 [tool.setuptools.packages.find]
 where = ["src"]
