@@ -79,31 +79,32 @@ def run_serverless(*, hab, eid, topics, on_message, cursor_store, retry_ms=1000,
     last_safety = _monotonic()
     try:
         while True:
-            fetch_topics = set()
+            nudge_received = False
 
             # Drain any nudges the pump pushed onto the thread-safe queue.
+            # NOTE: the nudge topic is advisory — the server sends the bare /fwd modifier form
+            # (e.g. "credential") while the client's subscribed topics are slash-prefixed
+            # ("/credential"). Using the nudge's topic string to narrow the fetch would build
+            # the wrong cursor key and the wrong qry topic (no slash => no server match).
+            # So the nudge is treated as a pure "wake-and-fetch" signal: on ANY nudge we
+            # re-drain ALL of the client's subscribed (slash-prefixed) topics past their cursors.
             while True:
                 try:
-                    nudge = pump.nudges.get_nowait()
+                    pump.nudges.get_nowait()
                 except queue.Empty:
                     break
-                topic = nudge.get("topic")
-                if topic:
-                    fetch_topics.add(topic)
-                else:
-                    # Intentional: a topic-less nudge (server doesn't know which topic changed)
-                    # fans out to ALL subscribed topics so nothing is missed.
-                    fetch_topics.update(topics)   # topic-less nudge => refetch all
+                nudge_received = True   # bare vs. slash form doesn't matter; wake → full drain
 
             # Safety-net: an infrequent backstop to catch a missed nudge.
+            should_fetch = nudge_received
             now = _monotonic()
             if (now - last_safety) * 1000.0 >= safety_net_ms:
                 last_safety = now
-                fetch_topics.update(topics)
+                should_fetch = True
 
-            if fetch_topics:
-                # ONE fetch per wake, covering the union of nudged/safety topics.
-                yield from fetch_once(hab=hab, eid=eid, topics=list(fetch_topics),
+            if should_fetch:
+                # ONE fetch per wake, covering ALL subscribed (slash-prefixed) topics.
+                yield from fetch_once(hab=hab, eid=eid, topics=topics,
                                       on_message=on_message, cursor_store=cursor_store,
                                       scheduler=scheduler)
 

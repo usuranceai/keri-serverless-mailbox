@@ -141,10 +141,26 @@ def test_subscribe_envelope_carries_signed_mbx_qry_with_current_cursors(monkeypa
 
 
 def test_nudge_triggers_exactly_one_fetch_and_advances_cursor(monkeypatch):
+    """I-1: a nudge with a BARE topic (server-side /fwd form, e.g. "credential") that does NOT
+    match the client's slash-prefixed subscribed topics must still trigger ONE fetch over the
+    client's OWN subscribed topics ("/credential"), not the bare nudge topic ("credential").
+
+    RED against the old union-nudged-topics code (it would fetch "credential" with no slash,
+    building cursor key ("Embx","credential") and qry topic "credential" => server miss).
+    GREEN after the fix (any nudge => re-drain subscribed ("/credential") past their cursors)."""
     received = []
     factory, holder = _make_pump_factory()
     cur = _FakeCursorStore()
     sched = _FakeScheduler()
+
+    # Capture the topics actually passed to build_and_post so we can assert the slash form.
+    captured_topics = []
+    real_build_qtopics = fetch_mod.build_qtopics
+    def capturing_build_qtopics(eid, topics, cursor_store):
+        captured_topics.extend(topics)
+        return real_build_qtopics(eid, topics, cursor_store)
+    monkeypatch.setattr(fetch_mod, "build_qtopics", capturing_build_qtopics)
+
     hab = _make_hab()
 
     calls = {"n": 0}
@@ -161,13 +177,18 @@ def test_nudge_triggers_exactly_one_fetch_and_advances_cursor(monkeypatch):
 
     def act(i):
         if i == 2 and holder.get("pump"):
-            holder["pump"].push_nudge("Ebob", "/credential", cursor=7)
+            # Push a nudge with the BARE topic form (no slash) — this is what the server sends
+            # (the /fwd modifier deposit bare form), which does NOT match "/credential".
+            holder["pump"].push_nudge("Ebob", "credential", cursor=7)
     # Run WELL past the single nudge (no early stop) to prove no redundant fetches on idle ticks.
     _drive(gen, holder, ticks=60, act=act)
 
     assert calls["n"] == 1                                # exactly ONE fetch, even after idle ticks
     assert received == [("/credential", b"AAAA-cesr")]    # raw bytes to on_message
     assert cur.saved[("Embx", "/credential")] == 7        # cursor advanced
+    # The fetch must have queried the CLIENT'S slash-prefixed subscribed topic, NOT the bare nudge.
+    assert "/credential" in captured_topics, "fetch used the bare nudge topic instead of the subscribed slash-prefixed topic"
+    assert "credential" not in captured_topics or "/credential" in captured_topics  # bare form must not be the only one
 
 
 def test_fetch_schedules_the_clientdoer_on_scheduler(monkeypatch):
