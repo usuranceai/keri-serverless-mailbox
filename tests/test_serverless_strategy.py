@@ -186,6 +186,9 @@ def test_nudge_triggers_exactly_one_fetch_and_advances_cursor(monkeypatch):
         return _fake_http_client([{"id": "7", "name": "/credential", "data": "AAAA-cesr"}])
     monkeypatch.setattr(fetch_mod.agenting, "httpClient", fake_httpClient)
     monkeypatch.setattr(fetch_mod.httping, "createCESRRequest", lambda msg, client, dest=None: None)
+    # Advance the fetch clock so the initial fetch_once quiet floor elapses quickly.
+    fetch_clock = {"t": 0.0}
+    monkeypatch.setattr(fetch_mod, "_monotonic", lambda: fetch_clock["t"])
 
     gen = serverless.run_serverless(
         hab=hab, eid="Embx", topics=["/credential"],
@@ -193,16 +196,20 @@ def test_nudge_triggers_exactly_one_fetch_and_advances_cursor(monkeypatch):
         scheduler=sched, ws_factory=factory, safety_net_ms=10_000_000, ping_ms=1_000_000)
 
     def act(i):
-        if i == 2 and holder.get("ws"):
+        fetch_clock["t"] = i * 1.0   # 1s per tick >> 0.25s quiet floor; initial fetch completes fast
+        if i == 5 and holder.get("ws") and holder["ws"].started:
             # Push a nudge with the BARE topic form (no slash) — this is what the server sends
             # (the /fwd modifier deposit bare form), which does NOT match "/credential".
             holder["ws"].push_nudge("Ebob", "credential", cursor=7)
     # Run WELL past the single nudge (no early stop) to prove no redundant fetches on idle ticks.
     _drive(gen, holder, ticks=60, act=act)
 
-    assert calls["n"] == 1                                # exactly ONE fetch, even after idle ticks
-    assert received == [("/credential", b"AAAA-cesr")]    # raw bytes to on_message
-    assert cur.saved[("Embx", "/credential")] == 7        # cursor advanced
+    # The loop was genuinely reached: ws.started is True and the nudge was consumed.
+    assert holder["ws"].started is True
+    assert holder["ws"].nudges.qsize() == 0             # nudge was consumed by the loop
+    assert calls["n"] == 2                              # initial drain + nudge-triggered fetch
+    assert received == [("/credential", b"AAAA-cesr"), ("/credential", b"AAAA-cesr")]  # both fetches delivered
+    assert cur.saved[("Embx", "/credential")] == 7      # cursor advanced by the nudge fetch
     # The fetch must have queried the CLIENT'S slash-prefixed subscribed topic, NOT the bare nudge.
     assert "/credential" in captured_topics, "fetch used the bare nudge topic instead of the subscribed slash-prefixed topic"
     assert "credential" not in captured_topics or "/credential" in captured_topics  # bare form must not be the only one
@@ -224,6 +231,9 @@ def test_fetch_schedules_the_clientdoer_on_scheduler(monkeypatch):
         return client, the_doer
     monkeypatch.setattr(fetch_mod.agenting, "httpClient", fake_httpClient)
     monkeypatch.setattr(fetch_mod.httping, "createCESRRequest", lambda msg, client, dest=None: None)
+    # Advance the fetch clock so the initial fetch_once quiet floor elapses quickly.
+    fetch_clock = {"t": 0.0}
+    monkeypatch.setattr(fetch_mod, "_monotonic", lambda: fetch_clock["t"])
 
     received = []
     gen = serverless.run_serverless(
@@ -232,12 +242,19 @@ def test_fetch_schedules_the_clientdoer_on_scheduler(monkeypatch):
         scheduler=sched, ws_factory=factory, safety_net_ms=10_000_000, ping_ms=1_000_000)
 
     def act(i):
-        if i == 2 and holder.get("ws"):
+        fetch_clock["t"] = i * 1.0   # 1s per tick >> 0.25s quiet floor; initial fetch completes fast
+        if i == 5 and holder.get("ws") and holder["ws"].started:
             holder["ws"].push_nudge("Ebob", "/credential")
     _drive(gen, holder, ticks=60, act=act)
 
-    assert sched.extended == [[the_doer]]   # the SAME clientDoer httpClient returned, scheduled ONCE
-    assert sched.removed == [[the_doer]]    # and removed when the one-shot drain completes
+    # The loop was genuinely reached: ws.started is True and the nudge was consumed.
+    assert holder["ws"].started is True
+    assert holder["ws"].nudges.qsize() == 0             # nudge was consumed by the loop
+    # Initial drain + nudge each schedule and remove the_doer once.
+    assert len(sched.extended) == 2                     # initial drain + nudge-triggered fetch
+    assert len(sched.removed) == 2                      # both fetches removed the clientDoer
+    assert sched.extended == [[the_doer], [the_doer]]   # the SAME clientDoer, scheduled twice
+    assert sched.removed == [[the_doer], [the_doer]]    # and removed twice
 
 
 def test_idle_after_initial_drain_does_not_fetch_again(monkeypatch):
@@ -291,6 +308,9 @@ def test_safety_net_fetch_fires_on_cadence_without_a_nudge(monkeypatch):
     # A monotonic clock the generator reads for cadence; the test advances it.
     clock = {"t": 0.0}
     monkeypatch.setattr(serverless, "_monotonic", lambda: clock["t"])
+    # Also advance the fetch clock so the initial fetch_once quiet floor elapses quickly.
+    fetch_clock = {"t": 0.0}
+    monkeypatch.setattr(fetch_mod, "_monotonic", lambda: fetch_clock["t"])
 
     gen = serverless.run_serverless(
         hab=hab, eid="Embx", topics=["/credential"],
@@ -298,10 +318,13 @@ def test_safety_net_fetch_fires_on_cadence_without_a_nudge(monkeypatch):
         scheduler=sched, ws_factory=factory, safety_net_ms=5000, ping_ms=1_000_000)
 
     def act(i):
-        clock["t"] = i * 1.0   # advance 1s per tick; safety_net_ms=5000 -> fires around tick 5
-    _drive(gen, holder, ticks=15, act=act, until=lambda: calls["n"] >= 1)
+        clock["t"] = i * 1.0        # advance 1s per tick; safety_net_ms=5000 -> fires around tick 5
+        fetch_clock["t"] = i * 1.0  # also advance fetch clock so initial drain exits quickly
+    _drive(gen, holder, ticks=30, act=act, until=lambda: calls["n"] >= 2)
 
-    assert calls["n"] >= 1            # safety-net fetched with no nudge
+    # The loop was genuinely reached: ws.started is True.
+    assert holder["ws"].started is True
+    assert calls["n"] >= 2            # initial drain + at least one safety-net fetch
 
 
 def test_initial_drain_on_connect_fetches_once_without_a_nudge(monkeypatch):
