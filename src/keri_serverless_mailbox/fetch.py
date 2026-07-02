@@ -34,6 +34,11 @@ _QUIET_FLOOR_S = 0.25
 # safety-net resume from the advanced cursor.
 _FETCH_CAP_S = 30.0
 
+# After the connection is up, how long to wait for the FIRST event before treating the mailbox
+# as empty. Covers the TLS connect + server first-response latency that a 0.25s quiet floor
+# measured from drain-entry would cut short (the request leaves client.requests before connect).
+_FIRST_EVENT_TIMEOUT_S = 8.0
+
 
 def build_qtopics(eid, topics, cursor_store):
     """Per-topic query cursors = the LAST-SEEN ordinal (or -1 if never seen).
@@ -108,13 +113,25 @@ def fetch_once(*, hab, eid, topics, on_message, cursor_store, scheduler):
         while client.requests:        # wait for the signed qry to flush over the wire
             yield tock
 
-        # Drain: read events until quiet-floor or the hard cap.
+        # Drain: read events until the backlog goes quiet, or the hard cap.
+        #
+        # The signed qry leaves client.requests before the TLS connection completes, so a quiet
+        # floor measured from drain-entry would give up mid-handshake — before the server's
+        # response (connect + first event can take a few seconds). Gate the give-up logic on the
+        # connection being established:
+        #   * while connecting: keep waiting (bounded only by the hard cap);
+        #   * connected, no event yet: wait _FIRST_EVENT_TIMEOUT_S for the first event (empty
+        #     mailbox => return);
+        #   * after events start: _QUIET_FLOOR_S of silence marks end-of-backlog.
+        # A client with no .connector (unit fakes) is treated as already connected, preserving
+        # the original immediate quiet-floor behavior.
         fetch_start = _monotonic()
-        last_event_t = _monotonic()   # quiet measured from drain entry when no events yet
+        last_event_t = _monotonic()
+        connected_at = None
+        delivered_ever = False
+        has_connector = getattr(client, "connector", None) is not None
         while True:
             now = _monotonic()
-
-            # Hard cap: a trickling-forever server must not spin indefinitely.
             if now - fetch_start >= _FETCH_CAP_S:
                 logger.info(
                     f"fetch_once hard cap ({_FETCH_CAP_S}s) reached for {eid}; "
@@ -122,9 +139,11 @@ def fetch_once(*, hab, eid, topics, on_message, cursor_store, scheduler):
                 )
                 return   # finally block still runs (scheduler.remove)
 
-            # Deliver all events queued so far in this service pass.
-            # Also check the hard cap inside this loop: if the server trickles one event per
-            # pass indefinitely the outer cap check is never reached from inside here.
+            connected = getattr(getattr(client, "connector", None), "connected", True)
+            if connected and connected_at is None:
+                connected_at = now
+                last_event_t = now      # start the quiet window at connect, not drain-entry
+
             delivered_any = False
             while client.events:
                 if _monotonic() - fetch_start >= _FETCH_CAP_S:
@@ -135,13 +154,23 @@ def fetch_once(*, hab, eid, topics, on_message, cursor_store, scheduler):
                     return
                 evt = client.events.popleft()
                 deliver_event(evt, on_message=on_message, cursor_store=cursor_store, eid=eid)
-                last_event_t = _monotonic()   # reset quiet clock on every delivered event
+                last_event_t = _monotonic()
+                delivered_ever = True
                 delivered_any = True
                 yield tock
 
-            # Quiet-floor check: if no event arrived for _QUIET_FLOOR_S, the drain is done.
-            if not delivered_any and (_monotonic() - last_event_t) >= _QUIET_FLOOR_S:
-                break
+            if not delivered_any and connected_at is not None:
+                if delivered_ever:
+                    # end-of-backlog: quiet floor after the last delivered event
+                    if (_monotonic() - last_event_t) >= _QUIET_FLOOR_S:
+                        break
+                elif not has_connector:
+                    # unit fake (no connector): preserve the original immediate quiet floor
+                    if (_monotonic() - last_event_t) >= _QUIET_FLOOR_S:
+                        break
+                elif (_monotonic() - connected_at) >= _FIRST_EVENT_TIMEOUT_S:
+                    # real client, connected, no event within the first-response window: empty
+                    break
 
             yield tock
     finally:

@@ -872,6 +872,64 @@ def test_drain_completes_after_quiet_floor(monkeypatch):
     assert sched.extended and sched.removed  # extend/remove lifecycle preserved
 
 
+def _fake_http_client_deferred(clock, ready_at, events):
+    """Fake httpClient whose .connector.connected flips True and whose .events become available
+    only once clock['t'] >= ready_at — simulating the real TLS connect + response latency the
+    drain must wait through (the drain-entry quiet floor used to give up before this)."""
+    import collections
+
+    class _Events(collections.deque):
+        def _release(self):
+            if clock["t"] >= ready_at and getattr(self, "_pend", None):
+                self.extend(self._pend)
+                self._pend = None
+
+        def __len__(self):
+            self._release()
+            return super().__len__()
+
+        def popleft(self):
+            self._release()
+            return super().popleft()
+
+    ev = _Events()
+    ev._pend = list(events)
+
+    class _Conn:
+        @property
+        def connected(self):
+            return clock["t"] >= ready_at
+
+    client = SimpleNamespace(requests=[], events=ev, connector=_Conn())
+    clientDoer = doing.Doer()
+    return client, clientDoer
+
+
+def test_fetch_waits_for_late_connection_before_giving_up(monkeypatch):
+    """REGRESSION: the drain must not quiet-floor before the TLS connection is up. With a client
+    whose connection + first event arrive only after a few seconds (real hio behavior), the fetch
+    must still deliver — the old drain-entry quiet floor gave up in 0.25s and delivered 0."""
+    factory, holder = _make_ws_factory()
+    cur = _FakeCursorStore()
+    sched = _FakeScheduler()
+    hab = _make_hab()
+    fetch_clock = {"t": 0.0}
+    monkeypatch.setattr(fetch_mod, "_monotonic", lambda: fetch_clock["t"])
+    monkeypatch.setattr(fetch_mod.httping, "createCESRRequest", lambda msg, client, dest=None: None)
+    events = [{"id": "0", "name": "/credential", "data": "AAAA-cesr", "retry": "1000"}]
+    monkeypatch.setattr(fetch_mod.agenting, "httpClient",
+                        lambda hab_, eid_: _fake_http_client_deferred(fetch_clock, 2.0, events))
+    received = []
+    gen = serverless.run_serverless(
+        hab=hab, eid="Embx", topics=["/credential"],
+        on_message=lambda t, r: received.append((t, r)), cursor_store=cur, retry_ms=1,
+        scheduler=sched, ws_factory=factory, safety_net_ms=10_000_000, ping_ms=1_000_000)
+    _drive(gen, holder, ticks=80, act=lambda i: fetch_clock.__setitem__("t", i * 0.25),
+           until=lambda: bool(received))
+    assert received == [("/credential", b"AAAA-cesr")], \
+        "late-arriving mail must be delivered, not dropped by an early quiet-floor"
+
+
 def test_hard_cap_bounds_a_never_quiet_fetch(monkeypatch):
     """A fake client that yields one event every pass without ever going quiet must be stopped
     at the hard cap (_FETCH_CAP_S). fetch_once must return (not loop forever)."""
