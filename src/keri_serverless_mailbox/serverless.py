@@ -38,7 +38,7 @@ from urllib.parse import urlparse
 from hio.core.tcp import clienting as tcp_clienting
 
 from keri import help
-from keri.kering import Schemes
+from keri.kering import Kinds, Schemes, Vrsn_1_0
 
 from .fetch import build_qtopics, fetch_once
 
@@ -110,7 +110,11 @@ def run_serverless(*, hab, eid, topics, on_message, cursor_store, retry_ms=1000,
         q_topics = build_qtopics(eid, topics, cursor_store)
         mhab = getattr(hab, "mhab", None)          # GroupHab: subscribe via the member hab
         querier = mhab if mhab is not None else hab
-        msg = querier.query(pre=hab.pre, src=eid, route="mbx", query=dict(pre=hab.pre, topics=q_topics))
+        # TRANSITIONAL (KERI v2 v1-hold): v1 JSON qry (slash-prefixed topic labels are
+        # illegal as v2 CESR map labels). Matches the deployed mailbox wire contract.
+        msg = querier.query(pre=hab.pre, src=eid, route="mbx",
+                            query=dict(pre=hab.pre, topics=q_topics),
+                            version=Vrsn_1_0, kind=Kinds.json)
         qry_b64 = base64.b64encode(bytes(msg)).decode("ascii")
         return {"action": "subscribe", "qry": qry_b64}
 

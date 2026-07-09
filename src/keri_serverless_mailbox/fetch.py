@@ -19,6 +19,7 @@ import traceback
 
 from keri.app import agenting, httping
 from keri import help, kering
+from keri.kering import Vrsn_1_0, Kinds
 
 logger = help.ogler.getLogger(__name__)
 
@@ -80,7 +81,11 @@ def build_and_post(hab, eid, topics, cursor_store, client):
     q = dict(pre=hab.pre, topics=q_topics)
     mhab = getattr(hab, "mhab", None)             # GroupHab: query via the member hab
     querier = mhab if mhab is not None else hab
-    msg = querier.query(pre=hab.pre, src=eid, route="mbx", query=q)
+    # TRANSITIONAL (KERI v2 v1-hold): the mailbox wire protocol keys query topics by
+    # slash-prefixed labels ('/receipt', ...), which v2 CESR Labeler forbids. Serialize
+    # the qry as v1 JSON (compatible with the deployed federation). Lifts with the hold.
+    msg = querier.query(pre=hab.pre, src=eid, route="mbx", query=q,
+                        version=Vrsn_1_0, kind=Kinds.json)
     httping.createCESRRequest(msg, client, dest=eid)
 
 
