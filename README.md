@@ -6,7 +6,7 @@ A small, reusable, KERI-native mailbox client for any KERI Python application. I
 
 **Standard strategy** (held-SSE poll, compatible with stock keripy mailboxes) — **implemented and tested**.
 
-**Serverless strategy** (WebSocket notify-and-fetch, for serverless mailboxes that push a ready-signal then serve a bounded fetch) — **stub only; raises `NotImplementedError`**. Reserved for a future release.
+**Serverless strategy** (WebSocket notify-and-fetch, for serverless mailboxes that push a ready-signal then serve a bounded fetch) — **implemented** (hio-native WebSocket client; no `websockets` dependency). End-to-end conformance against a deployed serverless mailbox stack is pending a fresh dev-stage deploy (see `tests/test_serverless_e2e.py`, skipped unless `MAILBOX_URL` is set).
 
 Capability discovery (`discover_strategy`) requires keripy carrying the `wss` location scheme. On stock keripy, discovery finds no `wss` endpoint and degrades gracefully to the Standard strategy.
 
@@ -52,7 +52,7 @@ doist.do(doers=[doer, ...])
 | `MailboxClientDoer` | class | hio `Doer` wrapper; drives the client generator |
 | `Strategy` | enum | `STANDARD`, `SERVERLESS` |
 | `StandardStrategy` | class | SSE-poll strategy (implemented) |
-| `ServerlessStrategy` | class | WS notify-and-fetch strategy (stub) |
+| `ServerlessStrategy` | class | WS notify-and-fetch strategy (implemented; hio-native) |
 | `CursorStore` | ABC | Implement to persist per-topic cursors |
 | `discover_strategy` | function | Inspects KEL for `wss` loc; returns `Strategy` |
 
