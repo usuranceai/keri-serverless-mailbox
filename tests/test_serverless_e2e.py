@@ -88,16 +88,25 @@ def _post_cesr(body):
 def _make_fwd(sender_hab, recipient_pre, topic, embedded_msg):
     """Signed /fwd exn depositing ``embedded_msg`` for ``recipient_pre``'s ``topic``.
 
-    Mirrors keripy's canonical forwarding construction (specialExchange + endorse)."""
+    ``/fwd`` keeps the legacy v1 ``specialExchange`` body shape (see
+    ``keri.app.forwarding._exchangeVersion``), so the endorsement attachment MUST carry a
+    matching v1 genus code (``gvrsn=Vrsn_1_0, genusify=True``). Without it, the mailbox
+    parser cannot associate the signatures with the v1 exn body ("Missing attached exchanger
+    signatures") and silently drops the deposit — the message never reaches storeMsg and the
+    drain comes back empty."""
     from keri.peer.exchanging import specialExchange
+    from keri.kering import Kinds, Vrsn_1_0
     fwd, atc = specialExchange(
         sender=sender_hab.pre,
         route="/fwd",
         modifiers={"pre": recipient_pre, "topic": topic},
         attributes={},
         embeds=dict(evt=bytes(embedded_msg)),
+        version=Vrsn_1_0,
+        kind=Kinds.json,
     )
-    signed = sender_hab.endorse(serder=fwd, last=False, framed=True)
+    signed = sender_hab.endorse(serder=fwd, last=False, framed=True,
+                               gvrsn=Vrsn_1_0, genusify=True)
     signed.extend(atc)
     return bytes(signed)
 
